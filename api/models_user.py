@@ -4,7 +4,7 @@ from django.contrib.auth.models import (
     BaseUserManager,AbstractBaseUser,PermissionsMixin
 )
 from .models_work import *
-from django.utils.translation import gettext as _
+from django.utils.translation import gettext_lazy as _
 
 class MyUserManager(BaseUserManager):
     def create_user(self, username, password=None):
@@ -32,8 +32,10 @@ class UserProfile(AbstractBaseUser, PermissionsMixin):
     username = models.CharField(_('用户名'), 
                                 unique=True,
                                 max_length=50)
+    email = models.CharField(_('邮箱'), max_length=120, blank=True, default='')
+    note = models.TextField(_('备注'), blank=True, default='')
     
-    rid = models.CharField(verbose_name='RustDesk ID', max_length=16)
+    rid = models.CharField(verbose_name='Camellia ID', max_length=16)
     uuid = models.CharField(verbose_name='uuid', max_length=60)
     autoLogin = models.BooleanField(verbose_name='autoLogin', default=True)
     rtype = models.CharField(verbose_name='rtype', max_length=20)
@@ -86,4 +88,3 @@ class UserProfile(AbstractBaseUser, PermissionsMixin):
             ("change_task_status", "Can change the status of tasks"),
             ("close_task", "Can remove a task by setting its status as closed"),
         )
-

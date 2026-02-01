@@ -3,11 +3,18 @@
 {% block title %}{{title}}{% endblock %}
 {% block legend_name %}{{ "信息" | translate }}{% endblock %}
 {% block content %} 
-<div style="padding: 20px; background-color: #F2F2F2;">
-  <div class="layui-row layui-col-space15">
+<section class="card">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{{ title }}</h2>
+      <p class="card-subtitle">{{ "系统消息" | translate }}</p>
+    </div>
+  </div>
+  <div class="card-body">
 {% autoescape off %}
-    {{msg}}
+    {{ msg }}
  {% endautoescape %}
-</div></div>
+  </div>
+</section>
 
 {% endblock %}

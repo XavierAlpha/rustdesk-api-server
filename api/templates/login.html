@@ -1,70 +1,105 @@
 {% load static %}
+{% load i18n %}
 {% load my_filters %}
 <!DOCTYPE html>
-<html lang="en">
+{% get_current_language as LANGUAGE_CODE %}
+<html lang="{{ LANGUAGE_CODE }}">
 <head>
     <meta charset="UTF-8">
- 
-    <title>{{ "登录" | translate }}_【RustDeskWeb】</title>
-        <link rel="stylesheet" href="{% static 'layui/css/layui.css' %}">
-        <link rel="stylesheet" href="{% static 'layui/css/style.css' %}">
-
- 
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <title>{{ "登录" | translate }}_【Camellia】</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{% static 'ui/app.css' %}">
 </head>
-<body>
- 
-<div class="login-main">
-    <header class="layui-elip">{{ "登录" | translate }}</header>
-    <form class="layui-form">
-        <div class="layui-input-inline">
-            <input type="text" name="account" required lay-verify="required" placeholder="{{ "用户名" | translate }}" autocomplete="off"
-                   class="layui-input">
+<body class="auth-body">
+  <div class="auth-shell">
+    <div class="auth-hero">
+      <div>
+        <h1>Camellia</h1>
+        <p>{{ "安全的远程控制与设备管理入口" | translate }}</p>
+      </div>
+      <div class="notice">
+        {{ "建议启用强密码并定期检查设备归属。" | translate }}
+      </div>
+    </div>
+    <div class="auth-card">
+      <h2>{{ "登录" | translate }}</h2>
+      <div id="form-message" class="form-message"></div>
+      <form id="login-form" action="/api/user_action?action=login" method="post">
+        {% csrf_token %}
+        <input type="hidden" name="next" id="next-url">
+        <div class="form-field">
+          <label for="account">{{ "用户名" | translate }}</label>
+          <input id="account" type="text" name="account" autocomplete="username" required placeholder="{{ "请输入用户名" | translate }}">
         </div>
-        <div class="layui-input-inline">
-            <input type="password" name="password" required lay-verify="required" placeholder="{{ "密码" | translate }}" autocomplete="off"
-                   class="layui-input">
+        <div class="form-field">
+          <label for="password">{{ "密码" | translate }}</label>
+          <input id="password" type="password" name="password" autocomplete="current-password" required placeholder="{{ "请输入密码" | translate }}">
         </div>
-        <div class="layui-input-inline login-btn">
-            <button lay-submit lay-filter="login" class="layui-btn">{{ "登录" | translate }}</button>
-        </div>
-        <hr/>
-        <p><a href="/api/user_action?action=register" class="fl">{{ "立即注册" | translate }}</a><a href="javascript:;" class="fr">{{ "忘记密码？" | translate }}</a></p>
-    </form>
-</div>
- 
- 
-<script src={% static "layui/layui.js" %}></script>
-<script type="text/javascript">
-    layui.use(['form','layer','jquery'], function () {
- 
-        // 操作对象
-        var form = layui.form;
-        var $ = layui.jquery;
-        form.on('submit(login)',function (data) {
-            console.log(data.field);
-            $.ajax({
-                url:'/api/user_action?action=login',
-                data:data.field,
-                dataType:'json',
-                type:'post',
+        <button type="submit" class="btn btn-primary" style="width: 100%;">{{ "登录" | translate }}</button>
+      </form>
+      <div class="auth-footer">
+        <div><a href="/api/user_action?action=register">{{ "立即注册" | translate }}</a></div>
+        <div class="muted" id="forget-link" style="margin-top: 8px;">{{ "忘记密码？" | translate }}</div>
+      </div>
+    </div>
+  </div>
 
-                success: function(resp) {
-		    			if(resp.code==1) {
-		    				//layer.alert(resp.msg,{icon:1});
-                            location.href = resp.url;
-		    			} else {
-		    				layer.alert(resp.msg,{icon:5});
-		    			}
-                }
-            })
-            return false;
-        })
-        $('.fr').on('click', function(){
-            layer.alert("{{ "这么简易的东西，忘记密码这功能就没必要了吧。" | translate }}",{icon:5});
-        })
+  <script>
+    const messageEl = document.getElementById('form-message');
+    const form = document.getElementById('login-form');
+    const getCookie = (name) => {
+      const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+      return match ? decodeURIComponent(match[2]) : '';
+    };
 
- 
+    const showMessage = (text) => {
+      messageEl.textContent = text;
+      messageEl.classList.add('is-visible');
+    };
+
+    document.getElementById('forget-link').addEventListener('click', () => {
+      showMessage('{{ "暂未开启找回密码功能，请联系管理员。" | translate | escapejs }}');
     });
-</script>
+
+    const nextField = document.getElementById('next-url');
+    const urlParams = new URLSearchParams(window.location.search);
+    const nextParam = urlParams.get('next') || '';
+    const registered = urlParams.get('registered') || '';
+    const isSafeNext = (value) => value.startsWith('/') && !value.startsWith('//');
+    if (nextParam && isSafeNext(nextParam)) {
+      nextField.value = nextParam;
+    }
+    if (registered === '1') {
+      showMessage('{{ "注册成功，请使用新账号登录。" | translate | escapejs }}');
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      messageEl.classList.remove('is-visible');
+      const formData = new FormData(form);
+      try {
+        const resp = await fetch(form.action, {
+          method: 'POST',
+          headers: {
+            'X-CSRFToken': getCookie('csrftoken'),
+          },
+          credentials: 'same-origin',
+          body: formData,
+        });
+        const data = await resp.json();
+        if (data.code === 1) {
+          const target = nextField.value && isSafeNext(nextField.value) ? nextField.value : data.url;
+          window.location.href = target;
+        } else {
+          showMessage(data.msg || '{{ "登录失败，请检查输入信息。" | translate | escapejs }}');
+        }
+      } catch (error) {
+        showMessage('{{ "网络异常，请稍后再试。" | translate | escapejs }}');
+      }
+    });
+  </script>
 </body>
 </html>

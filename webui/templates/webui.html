@@ -1,24 +1,27 @@
 {% load static %}<!DOCTYPE html>
-<html>
+<html lang="en">
 
 <head>
 
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
-  <meta name="description" content="Remote Desktop.">
+  <meta name="description" content="Camellia Remote Desktop.">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 
   <!-- iOS meta tags & icons -->
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
-  <meta name="apple-mobile-web-app-title" content="RustDesk">
+  <meta name="apple-mobile-web-app-title" content="Camellia">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
 
   <!-- Favicon -->
   <link rel="icon" type="image/svg+xml" href="favicon.svg" />
 
-  <title>RustDesk Web桌面</title>
+  <title>Camellia Web</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="manifest" href="{% static "/web_client/manifest.json" %}">
-  <script src=></script>
   <script src="{% static "/web_client/ogvjs-1.8.6/ogv.js" %}"></script>
   <script>
       var api = ["{{domain}}"];
@@ -27,49 +30,138 @@
   
   <script src="{% static "/web_client/js/yuv-canvas-1.2.6.js" %}"></script>
   <style>
-    .loading {
-      display: flex;
-      justify-content: center;
-      align-items: center;
+    :root {
+      --bg-start: #f7f3ea;
+      --bg-end: #e6f3ff;
+      --ink: #1a2332;
+      --ink-soft: #5a6676;
+      --accent: #0f766e;
+      --accent-2: #2563eb;
+    }
+
+    body {
       margin: 0;
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      -ms-transform: translate(-50%, -50%);
-      transform: translate(-50%, -50%);
+      min-height: 100vh;
+      font-family: "Space Grotesk", "Manrope", sans-serif;
+      color: var(--ink);
+      background: linear-gradient(140deg, var(--bg-start), var(--bg-end));
+    }
+
+    body::before,
+    body::after {
+      content: "";
+      position: fixed;
+      width: 420px;
+      height: 420px;
+      border-radius: 50%;
+      opacity: 0.25;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    body::before {
+      top: -120px;
+      right: -140px;
+      background: radial-gradient(circle at 30% 30%, #0f766e, transparent 65%);
+    }
+
+    body::after {
+      bottom: -140px;
+      left: -120px;
+      background: radial-gradient(circle at 30% 30%, #2563eb, transparent 65%);
+    }
+
+    .splash {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      z-index: 1;
+      background: rgba(255, 255, 255, 0.8);
+      backdrop-filter: blur(14px);
+      transition: opacity 0.6s ease, transform 0.6s ease;
+    }
+
+    .splash-inner {
+      display: grid;
+      gap: 18px;
+      text-align: center;
+      max-width: 360px;
+    }
+
+    .brand-mark {
+      width: 68px;
+      height: 68px;
+      border-radius: 18px;
+      background: linear-gradient(145deg, var(--accent), var(--accent-2));
+      color: #fff;
+      font-weight: 700;
+      font-size: 20px;
+      display: grid;
+      place-items: center;
+      margin: 0 auto;
+      letter-spacing: 2px;
+    }
+
+    .splash-title {
+      font-size: 22px;
+      font-weight: 700;
+      margin: 0;
+    }
+
+    .splash-subtitle {
+      font-size: 13px;
+      color: var(--ink-soft);
+      margin: 0;
     }
 
     .loader {
-      border: 16px solid #f3f3f3;
+      width: 64px;
+      height: 64px;
       border-radius: 50%;
-      border: 15px solid;
-      border-top: 16px solid #024eff;
-      border-right: 16px solid white;
-      border-bottom: 16px solid #024eff;
-      border-left: 16px solid white;
-      width: 120px;
-      height: 120px;
-      -webkit-animation: spin 2s linear infinite;
-      animation: spin 2s linear infinite;
+      border: 6px solid rgba(15, 118, 110, 0.2);
+      border-top-color: var(--accent);
+      animation: spin 1.2s linear infinite;
+      margin: 0 auto;
     }
 
-    @-webkit-keyframes spin {
-      0% {
-        -webkit-transform: rotate(0deg);
-      }
+    .progress {
+      height: 6px;
+      border-radius: 999px;
+      background: rgba(37, 99, 235, 0.15);
+      overflow: hidden;
+    }
 
-      100% {
-        -webkit-transform: rotate(360deg);
-      }
+    .progress::after {
+      content: "";
+      display: block;
+      height: 100%;
+      width: 40%;
+      background: linear-gradient(120deg, var(--accent), var(--accent-2));
+      animation: slide 1.4s ease-in-out infinite;
+    }
+
+    body.app-loaded .splash {
+      opacity: 0;
+      transform: translateY(-12px);
+      pointer-events: none;
     }
 
     @keyframes spin {
       0% {
         transform: rotate(0deg);
       }
-
       100% {
         transform: rotate(360deg);
+      }
+    }
+
+    @keyframes slide {
+      0% {
+        transform: translateX(-120%);
+      }
+      100% {
+        transform: translateX(220%);
       }
     }
   </style>
@@ -77,8 +169,16 @@
 </head>
 
 <body>
-  <div class="loading">
-    <div class="loader"></div>
+  <div class="splash" id="splash">
+    <div class="splash-inner">
+      <div class="brand-mark">RD</div>
+      <div>
+        <p class="splash-title">Camellia Web</p>
+        <p class="splash-subtitle">Secure remote access, loading workspace...</p>
+      </div>
+      <div class="loader"></div>
+      <div class="progress"></div>
+    </div>
   </div>
   <!-- This script installs service_worker.js to provide PWA functionality to
        application. For more information, see:
@@ -94,6 +194,9 @@
       var scriptTag = document.createElement('script');
       scriptTag.src = '{% static "/web_client/js/main.dart.js" %}';
       scriptTag.type = 'application/javascript';
+      scriptTag.onload = function () {
+        document.body.classList.add('app-loaded');
+      };
       document.body.append(scriptTag);
     }
 
@@ -147,7 +250,7 @@
       loadMainDartJs();
     }
   </script>
-  <script src={% static "/web_client/libs/firebase-app.js" %}?8.10.1"></script>
+  <script src="{% static "/web_client/libs/firebase-app.js" %}?8.10.1"></script>
 
   <script>
     // Your web app's Firebase configuration

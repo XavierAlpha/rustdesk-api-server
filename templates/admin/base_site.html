@@ -1,0 +1,23 @@
+{% extends "admin/base.html" %}
+{% load static %}
+{% load i18n %}
+
+{% block title %}{% trans "Camellia 管理后台" %}{% endblock %}
+
+{% block extrastyle %}
+{{ block.super }}
+<link rel="stylesheet" href="{% static 'admin/admin.css' %}">
+{% endblock %}
+
+{% block extrahead %}
+{{ block.super }}
+{% endblock %}
+
+{% block branding %}
+<h1 id="site-name">
+  <a href="{% url 'admin:index' %}">{% trans "Camellia 管理后台" %}</a>
+  <span class="site-subtitle">{% trans "管理后台" %}</span>
+</h1>
+{% endblock %}
+
+{% block nav-global %}{% endblock %}

@@ -43,6 +43,7 @@ MYSQL_HOST = os.environ.get("MYSQL_HOST", '127.0.0.1')
 MYSQL_USER = os.environ.get("MYSQL_USER", '-')
 MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", '-')
 MYSQL_PORT = os.environ.get("MYSQL_PORT", '3306')
+SQLITE_DB_PATH = os.environ.get("SQLITE_DB_PATH", "")
 # ==========数据库配置 结束=====================
 
 LANGUAGE_CODE = os.environ.get("LANGUAGE_CODE", 'zh-hans')
@@ -57,14 +58,13 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'api',
-    'webui',
+    'api.apps.ApiConfig',
+    'webui.apps.WebuiConfig',
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
-    'django.middleware.locale.LocaleMiddleware',
     'django.middleware.common.CommonMiddleware',
     # 'django.middleware.csrf.CsrfViewMiddleware',   # 取消post的验证。
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -77,7 +77,7 @@ ROOT_URLCONF = 'rustdesk_server_api.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -98,10 +98,11 @@ WSGI_APPLICATION = 'rustdesk_server_api.wsgi.application'
 # https://docs.djangoproject.com/en/3.1/ref/settings/#databases
 
 
+sqlite_name = SQLITE_DB_PATH if SQLITE_DB_PATH else (BASE_DIR / 'db/db.sqlite3')
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db/db.sqlite3',
+        'NAME': sqlite_name,
     }
 }
 if DATABASE_TYPE == 'MYSQL' and MYSQL_DBNAME != '-' and MYSQL_USER != '-' and MYSQL_PASSWORD != '-':
@@ -150,6 +151,39 @@ USE_L10N = True
 
 # USE_TZ = True
 USE_TZ = False
+
+# ==========日志配置 开始=====================
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = LOG_LEVEL if LOG_LEVEL in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL") else "INFO"
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "standard": {
+            "format": "[{asctime}] {levelname} {name}: {message}",
+            "style": "{",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "standard",
+            "level": LOG_LEVEL,
+        },
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": LOG_LEVEL,
+    },
+    "loggers": {
+        "django": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
+        "api": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
+        "webui": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
+    },
+}
+# ==========日志配置 结束=====================
 
 
 # Static files (CSS, JavaScript, Images)

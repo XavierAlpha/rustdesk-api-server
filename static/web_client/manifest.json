@@ -1,11 +1,11 @@
 {
-    "name": "rustdesk",
-    "short_name": "rustdesk",
+    "name": "Camellia",
+    "short_name": "Camellia",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "Remote Desktop.",
+    "description": "Camellia Remote Desktop.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

@@ -1,10 +1,10 @@
-# rustdesk-api-server
+# Camellia API Server
 
 
 [The English explanation is available by clicking here.](https://github.com/kingmo888/rustdesk-api-server/blob/master/README_EN.md)
 
 <p align="center">
-    <i>一个 python 实现的 Rustdesk API 接口，支持 WebUI 管理</i>
+    <i>一个 python 实现的 Camellia 管理 API（兼容 RustDesk 客户端/服务端），支持 WebUI 管理</i>
     <br/>
     <img src ="https://img.shields.io/badge/Version-1.5.2-blueviolet.svg"/>
     <img src ="https://img.shields.io/badge/Python-3.7|3.8|3.9|3.10|3.11-blue.svg" />

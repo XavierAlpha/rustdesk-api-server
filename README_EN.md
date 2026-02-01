@@ -1,4 +1,4 @@
-# rustdesk-api-server
+# Camellia API Server
 
 ## If the project has helped you, giving a star isn't too much, right?
 
@@ -7,7 +7,7 @@
 [点击这里查看中文说明。](https://github.com/kingmo888/rustdesk-api-server/blob/master/README.md)
 
 <p align="center">
-    <i>A Rustdesk API interface implemented in Python, with WebUI management support</i>
+    <i>A Camellia management API implemented in Python (compatible with RustDesk client/server), with WebUI management support</i>
     <br/>
     <img src ="https://img.shields.io/badge/Version-1.5.1-blueviolet.svg"/>
     <img src ="https://img.shields.io/badge/Python-3.7|3.8|3.9|3.10|3.11-blue.svg" />

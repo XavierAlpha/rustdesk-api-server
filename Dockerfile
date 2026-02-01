@@ -1,19 +1,32 @@
-FROM python:3.10.3-alpine
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /rustdesk-api-server
-ADD . /rustdesk-api-server
 
 # 安装系统依赖
-RUN apk add --no-cache \
-    gcc \
-    musl-dev \
-    mariadb-connector-c-dev \
-    pkgconfig
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        default-libmysqlclient-dev \
+        tzdata \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN set -ex \
-    && pip install --no-cache-dir --disable-pip-version-check -r requirements.txt \
-    && rm -rf /var/cache/apk/* \
-    && cp -r ./db ./db_bak
+COPY requirements.txt ./requirements.txt
+RUN pip install -r requirements.txt
+
+COPY . .
+RUN cp -r ./db ./db_bak
+RUN chmod -R u+rwX /rustdesk-api-server/db /rustdesk-api-server/db_bak
+
+RUN useradd -m -u 10001 appuser \
+    && chown -R appuser:appuser /rustdesk-api-server
+USER appuser
 
 ENV HOST="0.0.0.0"
 ENV TZ="Asia/Shanghai"

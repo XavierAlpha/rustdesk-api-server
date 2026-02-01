@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% load my_filters %}
+{% block title %}{{ "Camellia 控制台" | translate }}{% endblock %}
+{% block legend_name %}{{ "首页概览" | translate }}{% endblock %}
+{% block page_actions %}
+<a class="btn btn-secondary" href="/api/work">{{ "查看设备" | translate }}</a>
+{% if u.is_admin %}
+<a class="btn btn-secondary" href="/api/work?show_type=admin">{{ "管理员视图" | translate }}</a>
+{% endif %}
+{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{{ "设备概览" | translate }}</h2>
+      <p class="card-subtitle">{{ "实时掌握设备在线状态与更新节奏" | translate }}</p>
+    </div>
+    <span class="pill">{{ summary.total }} {{ "台设备" | translate }}</span>
+  </div>
+  <div class="card-body">
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="stat-label">{{ "在线设备" | translate }}</div>
+        <div class="stat-value">{{ summary.online }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{{ "离线设备" | translate }}</div>
+        <div class="stat-value">{{ summary.offline }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{{ "未知状态" | translate }}</div>
+        <div class="stat-value">{{ summary.unknown }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{{ "总设备数" | translate }}</div>
+        <div class="stat-value">{{ summary.total }}</div>
+      </div>
+    </div>
+    <div class="quick-actions">
+      <a class="qa-pill qa-pill-primary" href="/api/share">{{ "创建分享链接" | translate }}</a>
+      {% if u.is_admin %}
+      <a class="qa-pill qa-pill-secondary" href="/api/conn_log">{{ "连接日志" | translate }}</a>
+      <a class="qa-pill qa-pill-accent" href="/api/file_log">{{ "文件传输日志" | translate }}</a>
+      <a class="qa-pill qa-pill-ghost" href="/admin" target="_blank">{{ "打开管理后台" | translate }}</a>
+      {% endif %}
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{{ "最近更新设备" | translate }}</h2>
+      <p class="card-subtitle">{{ "最近 6 台设备的状态与更新时间" | translate }}</p>
+    </div>
+  </div>
+  <div class="card-body">
+    {% if recent %}
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>{{ "客户端ID" | translate }}</th>
+            {% if u.is_admin %}
+            <th>{{ "归属用户" | translate }}</th>
+            {% endif %}
+            <th>{{ "别名" | translate }}</th>
+            <th>{{ "设备组" | translate }}</th>
+            <th>{{ "更新时间" | translate }}</th>
+            <th>{{ "状态" | translate }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for one in recent %}
+          <tr>
+            <td>{{ one.rid|default:"-" }}</td>
+            {% if u.is_admin %}
+            <td>{{ one.owner_name|default:one.rust_user|default:"-" }}</td>
+            {% endif %}
+            <td>{{ one.alias|default:"-" }}</td>
+            <td>{{ one.device_group_name|default:"-" }}</td>
+            <td>{{ one.update_time|default:"-" }}</td>
+            <td>
+              <span class="status-pill {% if one.status == "在线"|translate %}is-online{% else %}is-offline{% endif %}">
+                {{ one.status|default:"-" }}
+              </span>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="notice is-warning">{{ "暂无设备数据，可前往设备页查看详情。" | translate }}</div>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}
