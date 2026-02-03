@@ -148,6 +148,36 @@ def model_to_dict2(instance, fields=None, exclude=None, replace=None, default=No
     return data
 
 
+DEVICE_DEFAULTS = {
+    'rid': '',
+    'alias': '',
+    'device_group_name': '',
+    'note': '',
+    'version': '',
+    'username': '',
+    'hostname': '',
+    'platform': '',
+    'os': '',
+    'cpu': '',
+    'memory': '',
+    'ip_address': '',
+    'create_time': '',
+    'update_time': '',
+    'status': '',
+    'owner_name': '',
+    'rust_user': '',
+    'strategy_name': '',
+    'has_rhash': '',
+}
+
+
+def _normalize_device_item(item):
+    for key, value in DEVICE_DEFAULTS.items():
+        if key not in item:
+            item[key] = value
+    return item
+
+
 def index(request):
     logger.debug('index args: %s', sys.argv)
     if request.user and getattr(request.user, 'is_authenticated', False):
@@ -284,6 +314,7 @@ def get_single_info(uid):
     for rid in peers.keys():
         rhash_value = peers[rid].get('rhash') or ''
         peers[rid]['has_rhash'] = _('是') if len(rhash_value) > 1 else _('否')
+        _normalize_device_item(peers[rid])
 
     return [v for k, v in peers.items()]
 
@@ -298,10 +329,14 @@ def get_all_info():
         device = devices.get(peer.rid, None)
         if device and user:
             devices[peer.rid]['rust_user'] = user.username
+            devices[peer.rid]['alias'] = peer.alias
 
     for rid in devices.keys():
         if not devices[rid].get('rust_user', ''):
             devices[rid]['rust_user'] = _('未登录')
+        if 'alias' not in devices[rid]:
+            devices[rid]['alias'] = ''
+        _normalize_device_item(devices[rid])
     for k, v in devices.items():
         try:
             last_update = datetime.datetime.strptime(v['update_time'], '%Y-%m-%d %H:%M')

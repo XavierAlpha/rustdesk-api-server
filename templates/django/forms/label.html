@@ -1,7 +1,6 @@
-{% with attrs=attrs|default_if_none:{}|default:{} %}
+{% load my_filters %}
 {% if use_tag %}
-<label{% if attrs %}{% for attr,val in attrs.items %} {{ attr }}{% if val != True %}="{{ val }}"{% endif %}{% endfor %}{% endif %}{% if required %} class="required"{% endif %}>{{ label }}{% if required %}<span class="required">*</span>{% endif %}</label>
+<label{{ attrs|safe_attrs }}>{{ label }}{% if field and field.field.required %}<span class="required">*</span>{% endif %}</label>
 {% else %}
 {{ label }}
 {% endif %}
-{% endwith %}

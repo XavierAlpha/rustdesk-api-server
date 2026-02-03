@@ -36,12 +36,24 @@
         <div class="stat-value">{{ summary.total }}</div>
       </div>
     </div>
-    <div class="quick-actions">
-      <a class="qa-pill qa-pill-primary" href="/api/share">{{ "创建分享链接" | translate }}</a>
+    <div class="action-tiles">
+      <a class="action-tile" href="/api/share">
+        <span class="action-tile-title">{{ "创建分享链接" | translate }}</span>
+        <span class="action-tile-meta">{{ "快速生成临时分享入口" | translate }}</span>
+      </a>
       {% if u.is_admin %}
-      <a class="qa-pill qa-pill-secondary" href="/api/conn_log">{{ "连接日志" | translate }}</a>
-      <a class="qa-pill qa-pill-accent" href="/api/file_log">{{ "文件传输日志" | translate }}</a>
-      <a class="qa-pill qa-pill-ghost" href="/admin" target="_blank">{{ "打开管理后台" | translate }}</a>
+      <a class="action-tile" href="/api/conn_log">
+        <span class="action-tile-title">{{ "连接日志" | translate }}</span>
+        <span class="action-tile-meta">{{ "查看最近的连接记录" | translate }}</span>
+      </a>
+      <a class="action-tile" href="/api/file_log">
+        <span class="action-tile-title">{{ "文件传输日志" | translate }}</span>
+        <span class="action-tile-meta">{{ "审计文件传输情况" | translate }}</span>
+      </a>
+      <a class="action-tile" href="/admin" target="_blank">
+        <span class="action-tile-title">{{ "打开管理后台" | translate }}</span>
+        <span class="action-tile-meta">{{ "管理用户与策略" | translate }}</span>
+      </a>
       {% endif %}
     </div>
   </div>
@@ -56,39 +68,36 @@
   </div>
   <div class="card-body">
     {% if recent %}
-    <div class="table-wrap">
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>{{ "客户端ID" | translate }}</th>
-            {% if u.is_admin %}
-            <th>{{ "归属用户" | translate }}</th>
-            {% endif %}
-            <th>{{ "别名" | translate }}</th>
-            <th>{{ "设备组" | translate }}</th>
-            <th>{{ "更新时间" | translate }}</th>
-            <th>{{ "状态" | translate }}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for one in recent %}
-          <tr>
-            <td>{{ one.rid|default:"-" }}</td>
-            {% if u.is_admin %}
-            <td>{{ one.owner_name|default:one.rust_user|default:"-" }}</td>
-            {% endif %}
-            <td>{{ one.alias|default:"-" }}</td>
-            <td>{{ one.device_group_name|default:"-" }}</td>
-            <td>{{ one.update_time|default:"-" }}</td>
-            <td>
-              <span class="status-pill {% if one.status == "在线"|translate %}is-online{% else %}is-offline{% endif %}">
-                {{ one.status|default:"-" }}
-              </span>
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+    <div class="panel-grid">
+      {% for one in recent %}
+      <article class="item-card">
+        <div class="item-header">
+          <div>
+            <h3 class="item-title">{{ one.rid|default:"-" }}</h3>
+            <div class="item-meta">{{ one.alias|default:"-" }} · {{ one.device_group_name|default:"-" }}</div>
+          </div>
+          <span class="status-pill {% if one.status == "在线"|translate %}is-online{% else %}is-offline{% endif %}">
+            {{ one.status|default:"-" }}
+          </span>
+        </div>
+        <div class="info-grid">
+          {% if u.is_admin %}
+          <div class="info-item">
+            <span>{{ "归属用户" | translate }}</span>
+            <strong>{{ one.owner_name|default:one.rust_user|default:"-" }}</strong>
+          </div>
+          {% endif %}
+          <div class="info-item">
+            <span>{{ "设备组" | translate }}</span>
+            <strong>{{ one.device_group_name|default:"-" }}</strong>
+          </div>
+          <div class="info-item">
+            <span>{{ "更新时间" | translate }}</span>
+            <strong>{{ one.update_time|default:"-" }}</strong>
+          </div>
+        </div>
+      </article>
+      {% endfor %}
     </div>
     {% else %}
     <div class="notice is-warning">{{ "暂无设备数据，可前往设备页查看详情。" | translate }}</div>

@@ -626,6 +626,7 @@ def heartbeat(request):
     if not postdata.get('id') or not postdata.get('uuid'):
         _log_event(request, 'api_heartbeat_missing_id', level="warning")
         return JsonResponse({'error': 'ID_NOT_FOUND'})
+    token = RustDeskToken.objects.filter(Q(rid=postdata['id']) & Q(uuid=postdata['uuid'])).first()
     device = RustDesDevice.objects.filter(Q(rid=postdata['id']) & Q(uuid=postdata['uuid'])).first()
     if device:
         client_ip = get_client_ip(request)
@@ -645,6 +646,16 @@ def heartbeat(request):
             ip_address=get_client_ip(request)
         )
         device.save()
+
+    owner_hint = ''
+    if device:
+        if device.owner_name:
+            owner_hint = device.owner_name
+        elif device.owner:
+            owner_hint = device.owner.username
+    if not owner_hint and token and token.username:
+        owner_hint = token.username
+
     # token保活
     expires_at = timezone.now() + datetime.timedelta(seconds=EFFECTIVE_SECONDS)
     RustDeskToken.objects.filter(Q(rid=postdata['id']) & Q(uuid=postdata['uuid'])).update(expires_at=expires_at)
@@ -664,7 +675,10 @@ def heartbeat(request):
                 except Exception:
                     options = {}
                 response['strategy'] = {'config_options': options, 'extra': {}}
-    _log_event(request, 'api_heartbeat', level="debug", rid=postdata.get('id', ''), uuid=postdata.get('uuid', ''))
+    if owner_hint:
+        _log_event(request, 'api_heartbeat', level="debug", username=owner_hint, rid=postdata.get('id', ''), uuid=postdata.get('uuid', ''))
+    else:
+        _log_event(request, 'api_heartbeat', level="debug", rid=postdata.get('id', ''), uuid=postdata.get('uuid', ''))
     return JsonResponse(response)
 
 

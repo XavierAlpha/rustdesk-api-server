@@ -1,0 +1,281 @@
+{% load static %}
+{% load i18n %}
+{% get_current_language as LANGUAGE_CODE %}
+<!DOCTYPE html>
+<html lang="{{ LANGUAGE_CODE }}">
+
+<head>
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="Camellia Web Client">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <meta name="theme-color" content="#c4495a">
+
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="Camellia Web">
+  <link rel="apple-touch-icon" href="{% static 'web_client/favicon.svg' %}">
+
+  <link rel="icon" type="image/svg+xml" href="{% static 'web_client/favicon.svg' %}">
+
+  <title>Camellia WebUI 2</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{% static 'webui2/app.css' %}">
+
+  <link rel="manifest" href="{% static 'web_client/manifest.json' %}">
+  <script src="{% static 'web_client/ogvjs-1.8.6/ogv.js' %}"></script>
+  <script>
+    var api = ["{{ domain }}"];
+  </script>
+  <script type="module" crossorigin src="{% static 'web_client/module/index.b7bb6fa2.js' %}"></script>
+  <script src="{% static 'web_client/js/yuv-canvas-1.2.6.js' %}"></script>
+</head>
+
+<body>
+  <div class="shell" id="webui2-shell">
+    <div class="shell-content">
+      <header class="shell-header">
+        <div class="brand">
+          <div class="brand-mark">
+            <span>C</span>
+          </div>
+          <div class="brand-copy">
+            <span class="brand-name">Camellia</span>
+            <span class="brand-tag">{% trans "Web Client 2" %}</span>
+          </div>
+        </div>
+        <div class="status-row">
+          <span class="status-pill">{% trans "端到端加密" %}</span>
+          <span class="status-pill">{% trans "低延迟" %}</span>
+          <span class="status-pill">{% trans "免安装" %}</span>
+        </div>
+      </header>
+
+      <main class="shell-main">
+        <section class="hero">
+          <p class="hero-kicker">Camellia WebUI 2</p>
+          <h1>{% blocktrans trimmed %}浏览器里的精致远程控制{% endblocktrans %}</h1>
+          <p class="hero-subtitle">
+            {% blocktrans trimmed %}正在建立安全会话，请保持页面开启以完成 Camellia 工作区加载。{% endblocktrans %}
+          </p>
+          <div class="hero-actions">
+            <button class="btn btn-primary" type="button" disabled data-cta="primary">{% trans "正在启动工作区" %}</button>
+            <button class="btn btn-ghost" type="button" disabled data-cta="secondary">{% trans "网络自检中" %}</button>
+          </div>
+          <div class="hero-tags">
+            <span>{% trans "自适应码率" %}</span>
+            <span>{% trans "设备已验证" %}</span>
+            <span>{% trans "中继已就绪" %}</span>
+          </div>
+        </section>
+
+        <aside class="status-panel">
+          <div class="panel-card">
+            <div class="panel-header">
+              <h2>{% trans "连接状态" %}</h2>
+              <span class="pulse-dot" aria-hidden="true"></span>
+            </div>
+            <div class="status-list">
+              <div class="status-item">
+                <span class="status-label">{% trans "ID 服务器" %}</span>
+                <span class="status-value" data-status="id-server">{% trans "解析中" %}</span>
+              </div>
+              <div class="status-item">
+                <span class="status-label">{% trans "当前用户" %}</span>
+                <span class="status-value" data-status="user">{% trans "校验中" %}</span>
+              </div>
+              <div class="status-item">
+                <span class="status-label">{% trans "API 心跳" %}</span>
+                <span class="status-value" data-status="api">{% trans "检测中" %}</span>
+              </div>
+            </div>
+            <div class="progress-track" aria-hidden="true">
+              <div class="progress-bar"></div>
+            </div>
+          </div>
+          <div class="panel-card panel-card-accent">
+            <h2>{% trans "快速提示" %}</h2>
+            <ul class="tip-list">
+              <li>{% trans "保持远端设备在线并避免休眠。" %}</li>
+              <li>{% trans "有线网络可获得更稳定的操控体验。" %}</li>
+              <li>{% trans "会话中支持剪贴板同步。" %}</li>
+            </ul>
+          </div>
+        </aside>
+      </main>
+
+      <section class="feature-grid">
+        <article class="feature-card">
+          <h3>{% trans "精准流媒体" %}</h3>
+          <p>{% trans "动态码率与清晰度调节，适配高并发与长时会话。" %}</p>
+          <span class="feature-foot">{% trans "音频与文件传输已就绪" %}</span>
+        </article>
+        <article class="feature-card">
+          <h3>{% trans "Camellia 中继" %}</h3>
+          <p>{% trans "专属中继链路，逐跳验证设备与身份。" %}</p>
+          <span class="feature-foot">{% trans "设备指纹已确认" %}</span>
+        </article>
+        <article class="feature-card">
+          <h3>{% trans "零安装体验" %}</h3>
+          <p>{% trans "无需额外下载，浏览器内快速启动安全控制。" %}</p>
+          <span class="feature-foot">{% trans "为现代 Chromium 优化" %}</span>
+        </article>
+      </section>
+
+      <footer class="shell-footer">
+        <span>{% trans "Camellia 远程平台" %}</span>
+        <span class="footer-meta">{% trans "WebUI 2 - Secure by design" %}</span>
+      </footer>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      var idServerNode = document.querySelector('[data-status="id-server"]');
+      var userNode = document.querySelector('[data-status="user"]');
+      var apiNode = document.querySelector('[data-status="api"]');
+      var primaryCta = document.querySelector('[data-cta="primary"]');
+      var secondaryCta = document.querySelector('[data-cta="secondary"]');
+
+      function setStatus(node, text, stateClass) {
+        if (!node) {
+          return;
+        }
+        node.textContent = text;
+        node.classList.remove('is-ok', 'is-warn', 'is-bad');
+        if (stateClass) {
+          node.classList.add(stateClass);
+        }
+      }
+
+      function setButton(node, text) {
+        if (!node) {
+          return;
+        }
+        node.textContent = text;
+      }
+
+      fetch('/webui2/status', { credentials: 'same-origin' })
+        .then(function (res) {
+          if (!res.ok) {
+            throw new Error('status');
+          }
+          return res.json();
+        })
+        .then(function (payload) {
+          var userLabel = payload.user ? payload.user : '{% trans "访客" %}';
+          if (payload.is_admin) {
+            userLabel = userLabel + ' ({% trans "管理员" %})';
+          }
+          setStatus(idServerNode, payload.id_server || payload.host || '{% trans "未知" %}', 'is-ok');
+          setStatus(userNode, userLabel, 'is-ok');
+        })
+        .catch(function () {
+          setStatus(idServerNode, '{% trans "不可用" %}', 'is-bad');
+          setStatus(userNode, '{% trans "无法读取" %}', 'is-bad');
+        });
+
+      fetch('/api/sysinfo_ver', { credentials: 'same-origin' })
+        .then(function (res) {
+          if (!res.ok) {
+            throw new Error('api');
+          }
+          return res.text();
+        })
+        .then(function (text) {
+          if (text && text.trim() === '1') {
+            setStatus(apiNode, '{% trans "在线" %}', 'is-ok');
+            setButton(secondaryCta, '{% trans "网络状态良好" %}');
+          } else {
+            setStatus(apiNode, '{% trans "波动" %}', 'is-warn');
+            setButton(secondaryCta, '{% trans "网络略有波动" %}');
+          }
+        })
+        .catch(function () {
+          setStatus(apiNode, '{% trans "离线" %}', 'is-bad');
+          setButton(secondaryCta, '{% trans "网络异常" %}');
+        });
+
+      setTimeout(function () {
+        setButton(primaryCta, '{% trans "工作区准备中" %}');
+      }, 1200);
+    })();
+  </script>
+
+  <script>
+    var serviceWorkerVersion = null;
+    var scriptLoaded = false;
+
+    function markLoaded() {
+      var primaryCta = document.querySelector('[data-cta="primary"]');
+      if (primaryCta) {
+        primaryCta.textContent = '{% trans "工作区已就绪" %}';
+      }
+      document.body.classList.add('app-loaded');
+    }
+
+    function loadMainDartJs() {
+      if (scriptLoaded) {
+        return;
+      }
+      scriptLoaded = true;
+      var scriptTag = document.createElement('script');
+      scriptTag.src = '{% static "web_client/js/main.dart.js" %}';
+      scriptTag.type = 'application/javascript';
+      scriptTag.onload = markLoaded;
+      document.body.append(scriptTag);
+    }
+
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        var serviceWorkerUrl = '{% static "web_client/flutter_service_worker.js" %}?v=' + serviceWorkerVersion;
+        navigator.serviceWorker.register(serviceWorkerUrl)
+          .then((reg) => {
+            function waitForActivation(serviceWorker) {
+              serviceWorker.addEventListener('statechange', () => {
+                if (serviceWorker.state == 'activated') {
+                  loadMainDartJs();
+                }
+              });
+            }
+            if (!reg.active && (reg.installing || reg.waiting)) {
+              waitForActivation(reg.installing || reg.waiting);
+            } else if (!reg.active.scriptURL.endsWith(serviceWorkerVersion)) {
+              reg.update();
+              waitForActivation(reg.installing);
+            } else {
+              loadMainDartJs();
+            }
+          });
+
+        setTimeout(() => {
+          if (!scriptLoaded) {
+            loadMainDartJs();
+          }
+        }, 4000);
+      });
+    } else {
+      loadMainDartJs();
+    }
+  </script>
+  <script src="{% static 'web_client/libs/firebase-app.js' %}?8.10.1"></script>
+  <script>
+    const firebaseConfig = {
+      apiKey: "AIzaSyCgehIZk1aFP0E7wZtYRRqrfvNiNAF39-A",
+      authDomain: "rustdesk.firebaseapp.com",
+      databaseURL: "https://rustdesk.firebaseio.com",
+      projectId: "rustdesk",
+      storageBucket: "rustdesk.appspot.com",
+      messagingSenderId: "768133699366",
+      appId: "1:768133699366:web:d50faf0792cb208d7993e7",
+      measurementId: "G-9PEH85N6ZQ"
+    };
+
+    firebase.initializeApp(firebaseConfig);
+  </script>
+</body>
+
+</html>

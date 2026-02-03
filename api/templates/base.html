@@ -12,7 +12,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{% static 'ui/app.css' %}">
     {% block link %}{% endblock %}
 </head>
@@ -20,44 +20,46 @@
 <body class="app-body">
     {% with current_user=u|default:request.user %}
     <header class="topbar">
-        <div class="brand">
-            <div class="brand-mark">CM</div>
-            <div class="brand-text">
-                <span class="brand-title">Camellia</span>
-                <span class="brand-subtitle">{% trans "管理控制台" %}</span>
+        <div class="topbar-inner">
+            <div class="brand">
+                <div class="brand-mark">CM</div>
+                <div class="brand-text">
+                    <span class="brand-title">Camellia</span>
+                    <span class="brand-subtitle">{% trans "管理控制台" %}</span>
+                </div>
             </div>
-        </div>
-        <nav class="nav-links">
-            <a class="nav-link{% if nav_active == 'home' %} is-active{% endif %}" href="/api/home">{% trans "首页" %}</a>
-            <a class="nav-link{% if nav_active == 'work' %} is-active{% endif %}" href="/api/work">{% trans "设备" %}</a>
-            {% if current_user.is_admin %}
-            <a class="nav-link{% if nav_active == 'work_admin' %} is-active{% endif %}" href="/api/work?show_type=admin">{% trans "所有设备" %}</a>
-            {% endif %}
-            <a class="nav-link{% if nav_active == 'share' %} is-active{% endif %}" href="/api/share">{% trans "分享" %}</a>
-            <a class="nav-link{% if nav_active == 'ab_dashboard' %} is-active{% endif %}" href="/api/ab_dashboard">{% trans "地址簿概览" %}</a>
-            <a class="nav-link{% if nav_active == 'ab_books' %} is-active{% endif %}" href="/api/ab_books">{% trans "地址簿管理" %}</a>
-            <a class="nav-link{% if nav_active == 'tag_manage' %} is-active{% endif %}" href="/api/tag_manage">{% trans "标签管理" %}</a>
-            <a class="nav-link{% if nav_active == 'ab_manage' %} is-active{% endif %}" href="/api/ab_manage">{% trans "地址簿权限" %}</a>
-            {% if current_user.is_admin %}
-            <a class="nav-link{% if nav_active == 'ab_rules' %} is-active{% endif %}" href="/api/ab_rules">{% trans "规则总览" %}</a>
-            <a class="nav-link{% if nav_active == 'ab_audit' %} is-active{% endif %}" href="/api/ab_audit">{% trans "规则审计" %}</a>
-            <a class="nav-link{% if nav_active == 'conn_log' %} is-active{% endif %}" href="/api/conn_log">{% trans "连接日志" %}</a>
-            <a class="nav-link{% if nav_active == 'file_log' %} is-active{% endif %}" href="/api/file_log">{% trans "文件传输日志" %}</a>
-            <a class="nav-link" href="/admin" target="_blank">{% trans "管理后台" %}</a>
-            {% endif %}
-            <a class="nav-link nav-cta" href="/webui" target="_blank">{% trans "网页控制" %}</a>
-            <a class="nav-link" href="/api/user_action?action=logout">{% trans "退出" %}</a>
-        </nav>
-        <div class="topbar-actions">
-            <div class="user-chip">
-                {% if current_user.username %}
-                <span>{{ current_user.username }}</span>
-                {% else %}
-                <span>{% trans "访客" %}</span>
-                {% endif %}
+            <nav class="nav-links">
+                <a class="nav-link{% if nav_active == 'home' %} is-active{% endif %}" href="/api/home">{% trans "首页" %}</a>
+                <a class="nav-link{% if nav_active == 'work' %} is-active{% endif %}" href="/api/work">{% trans "设备" %}</a>
                 {% if current_user.is_admin %}
-                <span class="user-badge">{% trans "管理员" %}</span>
+                <a class="nav-link{% if nav_active == 'work_admin' %} is-active{% endif %}" href="/api/work?show_type=admin">{% trans "所有设备" %}</a>
                 {% endif %}
+                <a class="nav-link{% if nav_active == 'share' %} is-active{% endif %}" href="/api/share">{% trans "分享" %}</a>
+                <a class="nav-link{% if nav_active == 'ab_dashboard' %} is-active{% endif %}" href="/api/ab_dashboard">{% trans "地址簿概览" %}</a>
+                <a class="nav-link{% if nav_active == 'ab_books' %} is-active{% endif %}" href="/api/ab_books">{% trans "地址簿管理" %}</a>
+                <a class="nav-link{% if nav_active == 'tag_manage' %} is-active{% endif %}" href="/api/tag_manage">{% trans "标签管理" %}</a>
+                <a class="nav-link{% if nav_active == 'ab_manage' %} is-active{% endif %}" href="/api/ab_manage">{% trans "地址簿权限" %}</a>
+                {% if current_user.is_admin %}
+                <a class="nav-link{% if nav_active == 'ab_rules' %} is-active{% endif %}" href="/api/ab_rules">{% trans "规则总览" %}</a>
+                <a class="nav-link{% if nav_active == 'ab_audit' %} is-active{% endif %}" href="/api/ab_audit">{% trans "规则审计" %}</a>
+                <a class="nav-link{% if nav_active == 'conn_log' %} is-active{% endif %}" href="/api/conn_log">{% trans "连接日志" %}</a>
+                <a class="nav-link{% if nav_active == 'file_log' %} is-active{% endif %}" href="/api/file_log">{% trans "文件传输日志" %}</a>
+                <a class="nav-link" href="/admin" target="_blank">{% trans "管理后台" %}</a>
+                {% endif %}
+                <a class="nav-link nav-cta" href="/webui2" target="_blank">{% trans "网页控制" %}</a>
+                <a class="nav-link" href="/api/user_action?action=logout">{% trans "退出" %}</a>
+            </nav>
+            <div class="topbar-actions">
+                <div class="user-chip">
+                    {% if current_user.username %}
+                    <span>{{ current_user.username }}</span>
+                    {% else %}
+                    <span>{% trans "访客" %}</span>
+                    {% endif %}
+                    {% if current_user.is_admin %}
+                    <span class="user-badge">{% trans "管理员" %}</span>
+                    {% endif %}
+                </div>
             </div>
         </div>
     </header>

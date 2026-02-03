@@ -10,14 +10,21 @@
     <title>{{ "登录" | translate }}_【Camellia】</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{% static 'ui/app.css' %}">
 </head>
 <body class="auth-body">
   <div class="auth-shell">
     <div class="auth-hero">
       <div>
-        <h1>Camellia</h1>
+        <div class="auth-brand">
+          <div class="brand-mark">CM</div>
+          <div class="brand-text">
+            <span class="brand-title">Camellia</span>
+            <span class="brand-subtitle">{{ "安全控制台" | translate }}</span>
+          </div>
+        </div>
+        <h1>{{ "欢迎回来" | translate }}</h1>
         <p>{{ "安全的远程控制与设备管理入口" | translate }}</p>
       </div>
       <div class="notice">

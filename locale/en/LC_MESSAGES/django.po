@@ -732,6 +732,58 @@ msgstr "Camellia Console"
 msgid "Camellia 管理后台"
 msgstr "Camellia Admin"
 
+#: .\api\templates\home.html:?
+msgid "快速生成临时分享入口"
+msgstr "Quickly generate a temporary sharing entry"
+
+#: .\api\templates\home.html:?
+msgid "查看最近的连接记录"
+msgstr "Review recent connection records"
+
+#: .\api\templates\home.html:?
+msgid "审计文件传输情况"
+msgstr "Audit file transfer activities"
+
+#: .\api\templates\home.html:?
+msgid "管理用户与策略"
+msgstr "Manage users and policies"
+
+#: .\api\templates\login.html:?
+msgid "安全控制台"
+msgstr "Secure Console"
+
+#: .\api\templates\login.html:?
+msgid "欢迎回来"
+msgstr "Welcome back"
+
+#: .\api\templates\reg.html:?
+msgid "注册失败，请检查输入信息。"
+msgstr "Registration failed. Please check your input."
+
+#: .\api\templates\share.html:?
+msgid "选择设备"
+msgstr "Select devices"
+
+#: .\api\templates\share.html:?
+msgid "支持搜索 ID 或别名"
+msgstr "Search by ID or alias"
+
+#: .\api\templates\share.html:?
+msgid "确认后生成分享链接"
+msgstr "Confirm to generate a share link"
+
+#: .\api\templates\share.html:?
+msgid "成功！如需分享，请复制以下链接给其他人："
+msgstr "Success! To share, copy the link below to others:"
+
+#: .\api\templates\share.html:?
+msgid "请求失败，请稍后重试。"
+msgstr "Request failed. Please try again later."
+
+#: .\api\templates\share.html:?
+msgid "网络异常，请稍后重试。"
+msgstr "Network error. Please try again later."
+
 #: .\templates\admin\index.html:6
 msgid "管理概览"
 msgstr "Admin Overview"
@@ -875,6 +927,18 @@ msgstr "System Message"
 #: .\api\templates\home.html:68 .\api\templates\show_work.html:27 .\api\templates\show_work.html:104
 msgid "设备组"
 msgstr "Device Group"
+
+#: .\api\models_work.py:67
+msgid "共享密码"
+msgstr "Share password"
+
+#: .\api\models_work.py:69
+msgid "登录账号"
+msgstr "Login account"
+
+#: .\api\models_work.py:70
+msgid "同服务器"
+msgstr "Same server"
 
 #: .\api\templates\share.html:11
 msgid "请确认后生成分享链接"

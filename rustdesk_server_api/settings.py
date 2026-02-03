@@ -11,9 +11,11 @@ https://docs.djangoproject.com/en/3.1/ref/settings/
 """
 import os
 from pathlib import Path
+import django
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+DJANGO_FORMS_TEMPLATES = Path(django.__file__).resolve().parent / 'forms' / 'templates'
 if "CSRF_TRUSTED_ORIGINS" in os.environ:
     CSRF_TRUSTED_ORIGINS = [os.environ["CSRF_TRUSTED_ORIGINS"]]
 else:
@@ -60,6 +62,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'api.apps.ApiConfig',
     'webui.apps.WebuiConfig',
+    'webui2.apps.Webui2Config',
 ]
 
 MIDDLEWARE = [
@@ -77,7 +80,7 @@ ROOT_URLCONF = 'rustdesk_server_api.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [BASE_DIR / 'templates'],
+        'DIRS': [BASE_DIR / 'templates', DJANGO_FORMS_TEMPLATES],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -90,6 +93,7 @@ TEMPLATES = [
         },
     },
 ]
+FORM_RENDERER = 'django.forms.renderers.TemplatesSetting'
 
 WSGI_APPLICATION = 'rustdesk_server_api.wsgi.application'
 

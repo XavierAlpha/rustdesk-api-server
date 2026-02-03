@@ -12,13 +12,20 @@
     <title>{{ "注册" | translate }}_【Camellia】</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{% static 'ui/app.css' %}">
 </head>
 <body class="auth-body">
   <div class="auth-shell">
     <div class="auth-hero">
       <div>
+        <div class="auth-brand">
+          <div class="brand-mark">CM</div>
+          <div class="brand-text">
+            <span class="brand-title">Camellia</span>
+            <span class="brand-subtitle">{{ "安全控制台" | translate }}</span>
+          </div>
+        </div>
         <h1>{{ "创建新账号" | translate }}</h1>
         <p>{{ "注册后即可通过 Web 管理界面统一管理设备与日志。" | translate }}</p>
       </div>

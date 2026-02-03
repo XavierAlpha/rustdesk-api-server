@@ -13,8 +13,14 @@
     <button id="create" type="button" class="btn btn-primary">{{ "生成分享链接" | translate }}</button>
   </div>
   <div class="card-body">
-    <div class="share-layout">
-      <div>
+    <div class="panel-grid">
+      <div class="item-card">
+        <div class="item-header">
+          <div>
+            <h3 class="item-title">{{ "选择设备" | translate }}</h3>
+            <div class="item-meta">{{ "支持搜索 ID 或别名" | translate }}</div>
+          </div>
+        </div>
         <div class="form-field">
           <label for="peer-search">{{ "搜索设备" | translate }}</label>
           <input id="peer-search" type="text" placeholder="{{ "输入 Camellia ID 或别名" | translate }}">
@@ -23,9 +29,14 @@
           <div class="picker-list" id="peer-list"></div>
         </div>
       </div>
-      <div>
+      <div class="item-card">
+        <div class="item-header">
+          <div>
+            <h3 class="item-title">{{ "已选择设备" | translate }}</h3>
+            <div class="item-meta">{{ "确认后生成分享链接" | translate }}</div>
+          </div>
+        </div>
         <div class="form-field">
-          <label>{{ "已选择设备" | translate }}</label>
           <div class="tag-list" id="selected-tags"></div>
         </div>
         <div class="notice is-warning">
@@ -47,31 +58,36 @@
     </div>
   </div>
   <div class="card-body">
-    <div class="table-wrap">
-      <table class="data-table">
-        <thead>
-          <tr>
-            {% if is_admin %}
-            <th>{{ "归属用户" | translate }}</th>
-            {% endif %}
-            <th>{{ "链接地址" | translate }}</th>
-            <th>{{ "创建时间" | translate }}</th>
-            <th>{{ "ID列表" | translate }}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for one in sharelinks %}
-          <tr>
-            {% if is_admin %}
-            <td>{{ one.owner }}</td>
-            {% endif %}
-            <td><script>document.write(window.location);</script>/{{ one.shash }}</td>
-            <td>{{ one.create_time }}</td>
-            <td>{{ one.peers }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+    <div class="panel-grid">
+      {% for one in sharelinks %}
+      <article class="item-card">
+        <div class="item-header">
+          <div>
+            <h3 class="item-title">{{ one.shash }}</h3>
+            <div class="item-meta">{{ one.create_time }}</div>
+          </div>
+          {% if is_admin %}
+          <span class="pill">{{ one.owner }}</span>
+          {% endif %}
+        </div>
+        <div class="info-grid">
+          {% if is_admin %}
+          <div class="info-item">
+            <span>{{ "归属用户" | translate }}</span>
+            <strong>{{ one.owner }}</strong>
+          </div>
+          {% endif %}
+          <div class="info-item">
+            <span>{{ "链接地址" | translate }}</span>
+            <strong class="share-url" data-shash="{{ one.shash }}"></strong>
+          </div>
+          <div class="info-item">
+            <span>{{ "ID列表" | translate }}</span>
+            <strong>{{ one.peers }}</strong>
+          </div>
+        </div>
+      </article>
+      {% endfor %}
     </div>
   </div>
 </section>
@@ -79,7 +95,7 @@
 <script>
   const peers = [
     {% for peer in peers %}
-    { value: "{{ peer.id }}", title: "{{ peer.name|escapejs }}" },
+    { value: "{{ peer.id }}", title: "{{ peer.name|escapejs }}" }{% if not forloop.last %},{% endif %}
     {% endfor %}
   ];
 
@@ -88,6 +104,10 @@
   const tagsEl = document.getElementById('selected-tags');
   const searchEl = document.getElementById('peer-search');
   const messageEl = document.getElementById('share-message');
+  const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
+  document.querySelectorAll('.share-url').forEach((el) => {
+    el.textContent = baseUrl + '/' + el.dataset.shash;
+  });
 
   const renderList = () => {
     const keyword = (searchEl.value || '').toLowerCase();
@@ -166,7 +186,7 @@
       });
       const data = await resp.json();
       if (data.code === 1) {
-        messageEl.textContent = '{{ "成功！如需分享，请复制以下链接给其他人：" | translate | escapejs }}' + ' ' + window.location + '/' + data.shash;
+        messageEl.textContent = '{{ "成功！如需分享，请复制以下链接给其他人：" | translate | escapejs }}' + ' ' + baseUrl + '/' + data.shash;
         messageEl.className = 'notice is-success';
         messageEl.style.display = 'block';
       } else {
