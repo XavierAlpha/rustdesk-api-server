@@ -1,0 +1,87 @@
+# cython:language_level=3
+from django.db import models
+from django.contrib.auth.models import (
+    BaseUserManager,AbstractBaseUser,PermissionsMixin
+)
+from .models_work import *
+from django.utils.translation import gettext_lazy as _
+
+class MyUserManager(BaseUserManager):
+    def create_user(self, username, password=None, **extra_fields):
+        if not username:
+            raise ValueError('Users must have an username')
+
+        user = self.model(username=username, **extra_fields)
+ 
+        user.set_password(password)
+        user.save(using=self._db)
+        return user
+ 
+    def create_superuser(self, username, password, **extra_fields):
+        user = self.create_user(username, password=password, **extra_fields)
+        user.is_admin = True
+        user.is_superuser = True
+        user.save(using=self._db)
+        return user
+
+
+class UserProfile(AbstractBaseUser, PermissionsMixin):
+    username = models.CharField(_('用户名'), 
+                                unique=True,
+                                max_length=50)
+    email = models.CharField(_('邮箱'), max_length=120, blank=True, default='')
+    note = models.TextField(_('备注'), blank=True, default='')
+    group_name = models.CharField(_('用户组'), max_length=120, blank=True, default='')
+    strategy_name = models.CharField(_('策略名称'), max_length=60, blank=True, default='')
+    
+    rid = models.CharField(verbose_name='Camellia ID', max_length=16)
+    uuid = models.CharField(verbose_name='uuid', max_length=60)
+    autoLogin = models.BooleanField(verbose_name='autoLogin', default=True)
+    rtype = models.CharField(verbose_name='rtype', max_length=20)
+    deviceInfo = models.TextField(verbose_name=_('登录信息:'), blank=True)
+    
+    is_active = models.BooleanField(verbose_name=_('是否激活'), default=True)
+    is_admin = models.BooleanField(verbose_name=_('是否管理员'), default=False)
+    tfa_enforced = models.BooleanField(verbose_name=_('强制双因素认证'), default=False)
+    login_verification_disabled = models.BooleanField(verbose_name=_('禁用登录验证'), default=False)
+
+    objects = MyUserManager()
+ 
+    USERNAME_FIELD = 'username'  # 用作用户名的字段
+    REQUIRED_FIELDS = []
+    
+    
+    def get_full_name(self):
+        # The user is identified by their email address
+        return self.username
+ 
+    def get_short_name(self):
+        # The user is identified by their email address
+        return self.username
+ 
+    def __str__(self):              # __unicode__ on Python 2
+        return self.username
+ 
+    def has_perm(self, perm, obj=None):    #有没有指定的权限
+        return self.is_active and (self.is_admin or self.is_superuser)
+ 
+    def has_module_perms(self, app_label):
+        return self.is_active and (self.is_admin or self.is_superuser)
+        
+
+
+    @property
+    def is_staff(self):
+        "Is the user a member of staff?"
+        # Simplest possible answer: All admins are staff 
+        return self.is_admin
+
+    class Meta:
+    
+        verbose_name = _("用户")
+        verbose_name_plural = _("用户列表")
+        permissions = (
+            ("view_task", "Can see available tasks"),
+            ("change_task_status", "Can change the status of tasks"),
+            ("close_task", "Can remove a task by setting its status as closed"),
+        )
