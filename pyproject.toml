@@ -1,0 +1,25 @@
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+extend-exclude = [
+  "static",
+  "static_root",
+  "static/web_client",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "B"]
+ignore = ["E501", "F403", "F405"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "rustdesk_server_api.settings"
+python_files = ["tests.py", "test_*.py", "*_tests.py"]
+addopts = "--strict-markers --reuse-db"
+
+[tool.coverage.run]
+source = ["api", "webui2", "rustdesk_server_api"]
+omit = ["*/migrations/*", "*/tests.py"]
+
+[tool.coverage.report]
+skip_covered = true
+show_missing = true

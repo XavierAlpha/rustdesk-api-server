@@ -1,0 +1,46 @@
+# Python
+*.pyc
+*.pyo
+*.spec
+*.c
+*.pyd
+*.so
+test.py
+__pycache__
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Documents
+test
+
+
+# Files
+*.bat
+server.ico
+start.py
+.env
+.env.*
+!.env.example
+
+# Build
+build
+dist
+dist-
+dist_py38
+!static/web_client/js/dist/
+!static/web_client/js/dist/**
+static_root/
+records/
+db/*.sqlite3
+db.sqlite3
+db.sqlite3_bak
+static/web_client/js/node_modules/
+
+LICENSE.rst
+
+db/test_db.sqlite3
+job2en.py

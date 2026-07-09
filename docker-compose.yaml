@@ -1,0 +1,46 @@
+version: "3.8"
+services:
+  camellia-server:
+    container_name: camellia-server
+    build:
+      context: .
+    environment:
+      HOST: "0.0.0.0"
+      TZ: "Asia/Shanghai"
+      SECRET_KEY: "<replace-with-a-long-random-secret>"
+      DEBUG: "false"
+      LOG_LEVEL: "INFO"
+      LANGUAGE_CODE: "zh-hans"
+      ALLOW_REGISTRATION: "true"
+      CSRF_TRUSTED_ORIGINS: "https://api.example.com,https://admin.example.com"
+
+      # Web client connection defaults:
+      # - ID service default port = DEFAULT_ID_PORT
+      # - Relay default = DEFAULT_ID_PORT + 1
+      # - WebSocket ID default = DEFAULT_ID_PORT + 2
+      # - WebSocket relay default = DEFAULT_ID_PORT + 3
+      DEFAULT_ID_PORT: "52116"
+
+      # Multi-value supported: comma/semicolon/space/newline.
+      # Recommended production (HTTPS page): wss://...
+      ID_SERVER: "wss://id-a.example.com,wss://id-b.example.com"
+
+      # Optional. Keep empty to auto-derive from ID_SERVER.
+      RELAY_SERVER: ""
+
+      # API endpoint shown to web client settings page.
+      API_SERVER: "https://api.example.com"
+
+      # Required: public key matching rustdesk-server RS_PRIV_KEY.
+      RS_PUB_KEY: "<replace-with-base64-pubkey>"
+
+      DATABASE_TYPE: "SQLITE"
+      SQLITE_DB_PATH: "/camellia-server/db/db.sqlite3"
+    volumes:
+      - ./db:/camellia-server/db
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    network_mode: bridge
+    ports:
+      - "21114:21114"
+    restart: unless-stopped

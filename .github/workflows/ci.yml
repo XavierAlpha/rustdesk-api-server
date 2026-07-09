@@ -1,0 +1,60 @@
+name: API Server CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: Run Django checks and tests
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DEBUG: "true"
+      SECRET_KEY: ci-only-secret-key
+      ALLOWED_HOSTS: "127.0.0.1,localhost"
+      CSRF_TRUSTED_ORIGINS: "http://127.0.0.1:21114"
+      SQLITE_DB_PATH: /tmp/camellia-api.sqlite3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Static analysis
+        run: |
+          python -m compileall api webui2 rustdesk_server_api
+          python -m ruff check api webui2 rustdesk_server_api
+
+      - name: Django checks
+        run: |
+          python manage.py check
+          python manage.py makemigrations --check --dry-run
+
+      - name: Tests
+        run: python -m pytest
