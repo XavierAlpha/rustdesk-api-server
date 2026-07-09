@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="28" fill="#1b1d23"/>
+  <g transform="scale(.125)"><defs><path id="p" d="M467 482C332 405 343 247 512 154C681 247 692 405 557 482Q512 522 467 482Z"/></defs><use href="#p" fill="#7378f2"/><use href="#p" fill="#5b94e8" transform="rotate(60 512 512)"/><use href="#p" fill="#43b8d1" transform="rotate(120 512 512)"/><use href="#p" fill="#7378f2" transform="rotate(180 512 512)"/><use href="#p" fill="#5b94e8" transform="rotate(240 512 512)"/><use href="#p" fill="#43b8d1" transform="rotate(300 512 512)"/></g>
+  <circle cx="64" cy="64" r="11.4" fill="#1b1d23"/><circle cx="64" cy="64" r="6.1" fill="#f7f8fa"/>
+</svg>

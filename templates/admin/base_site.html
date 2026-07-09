@@ -11,16 +11,8 @@
 
 {% block extrahead %}
 {{ block.super }}
-<script>
-  (function () {
-    try {
-      localStorage.setItem("theme", "light");
-    } catch (e) {
-      /* ignore */
-    }
-    document.documentElement.setAttribute("data-theme", "light");
-  })();
-</script>
+<link rel="icon" type="image/svg+xml" href="{% static 'web_client/favicon.svg' %}">
+<meta name="theme-color" content="#397bff">
 {% endblock %}
 
 {% block branding %}

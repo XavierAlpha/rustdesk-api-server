@@ -59,7 +59,7 @@
             <td>{{ one.create_time }}</td>
             <td>{{ one.update_time }}</td>
             <td>
-              <span class="status-pill {% if one.status == "在线"|translate %}is-online{% else %}is-offline{% endif %}">
+              <span class="status-pill {% if one.status == "在线"|translate %}is-online{% elif one.status == "离线"|translate %}is-offline{% else %}is-unknown{% endif %}">
                 {{ one.status }}
               </span>
             </td>
@@ -132,7 +132,7 @@
             <td>{{ one.create_time }}</td>
             <td>{{ one.update_time }}</td>
             <td>
-              <span class="status-pill {% if one.status == "在线"|translate %}is-online{% else %}is-offline{% endif %}">
+              <span class="status-pill {% if one.status == "在线"|translate %}is-online{% elif one.status == "离线"|translate %}is-offline{% else %}is-unknown{% endif %}">
                 {{ one.status }}
               </span>
             </td>

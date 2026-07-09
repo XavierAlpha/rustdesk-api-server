@@ -1,8 +1,8 @@
 import json
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
-from api.models import DeviceGroup, RustDesDevice, StrategyProfile, UserProfile
+from api.models import DeviceGroup, RustDesDevice, RustDeskPeer, StrategyProfile, UserProfile
 
 
 class ApiContractTests(TestCase):
@@ -222,3 +222,60 @@ class ApiContractTests(TestCase):
         self.assertEqual(response.status_code, 200, response.content)
         device.refresh_from_db()
         self.assertEqual(device.device_group_name, "")
+
+    @override_settings(
+        STORAGES={
+            "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+            "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+        }
+    )
+    def test_front_device_page_uses_modern_device_owner_relation(self):
+        self._device(owner=self.user, rid="765432100", uuid="owned-device")
+        self.client.force_login(self.user)
+
+        response = self.client.get("/api/work")
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.context["page_obj"].paginator.count, 1)
+        self.assertContains(response, "765432100")
+
+    @override_settings(
+        STORAGES={
+            "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+            "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+        }
+    )
+    def test_front_device_pages_merge_legacy_metadata_and_expose_unknown_state(self):
+        self._device(owner=self.user, rid="765432100", uuid="owned-device")
+        RustDeskPeer.objects.create(
+            uid=str(self.user.id),
+            rid="765432100",
+            username="desktop-user",
+            hostname="desktop",
+            alias="Primary desktop",
+            platform="Linux",
+            tags="work",
+            rhash="secret-hash",
+        )
+        RustDeskPeer.objects.create(
+            uid=str(self.user.id),
+            rid="765432101",
+            username="address-book-user",
+            hostname="unknown",
+            alias="Address book only",
+            platform="Android",
+            tags="mobile",
+            rhash="",
+        )
+        self.client.force_login(self.user)
+
+        work_response = self.client.get("/api/work")
+        home_response = self.client.get("/api/home")
+
+        self.assertEqual(work_response.status_code, 200, work_response.content)
+        items = {item["rid"]: item for item in work_response.context["page_obj"]}
+        self.assertEqual(set(items), {"765432100", "765432101"})
+        self.assertEqual(items["765432100"]["alias"], "Primary desktop")
+        self.assertEqual(items["765432100"]["platform"], "Linux")
+        self.assertEqual(items["765432101"]["status"], "未知状态")
+        self.assertEqual(home_response.context["summary"], {"total": 2, "online": 1, "offline": 0, "unknown": 1})

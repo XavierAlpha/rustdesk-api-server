@@ -168,6 +168,7 @@ def _normalize_device_item(item):
     for key, value in DEVICE_DEFAULTS.items():
         if key not in item:
             item[key] = value
+    item['rid'] = str(item.get('rid') or '')
     return item
 
 
@@ -285,31 +286,38 @@ def user_logout(request):
 
 
 def get_single_info(uid):
-    peers = RustDeskPeer.objects.filter(Q(uid=uid))
-    rids = [x.rid for x in peers]
-    peers = {x.rid: model_to_dict(x) for x in peers}
-    # print(peers)
-    devices = RustDesDevice.objects.filter(rid__in=rids)
-    devices = {x.rid: x for x in devices}
+    user = UserProfile.objects.filter(Q(id=uid)).first()
+    legacy_peers = {x.rid: model_to_dict(x) for x in RustDeskPeer.objects.filter(Q(uid=uid))}
+    devices = RustDesDevice.objects.filter(Q(owner_id=uid) | Q(rid__in=legacy_peers.keys())).distinct()
     now = timezone.now()
-    for rid, device in devices.items():
-        peers[rid]['create_time'] = device.create_time.strftime('%Y-%m-%d')
-        peers[rid]['update_time'] = device.update_time.strftime('%Y-%m-%d %H:%M')
-        peers[rid]['version'] = device.version
-        peers[rid]['memory'] = device.memory
-        peers[rid]['cpu'] = device.cpu
-        peers[rid]['os'] = device.os
-        peers[rid]['device_group_name'] = device.device_group_name or peers[rid].get('device_group_name', '')
-        peers[rid]['note'] = device.note or peers[rid].get('note', '')
-        peers[rid]['strategy_name'] = device.strategy_name or peers[rid].get('strategy_name', '')
-        peers[rid]['status'] = _('在线') if (now - device.update_time).total_seconds() <= 120 else _('离线')
+    items = {}
+    for device in devices:
+        item = model_to_dict2(device)
+        legacy = legacy_peers.pop(device.rid, None)
+        if legacy:
+            for key in ('alias', 'platform', 'rhash', 'password'):
+                if legacy.get(key):
+                    item[key] = legacy[key]
+            if not item.get('device_group_name'):
+                item['device_group_name'] = legacy.get('device_group_name', '')
+            if not item.get('note'):
+                item['note'] = legacy.get('note', '')
+        item['rust_user'] = item.get('owner_name') or (user.username if user else '')
+        item['status'] = _('在线') if (now - device.update_time).total_seconds() <= 120 else _('离线')
+        rhash_value = item.get('rhash') or ''
+        item['has_rhash'] = _('是') if len(rhash_value) > 1 else _('否')
+        items[device.rid] = _normalize_device_item(item)
 
-    for rid in peers.keys():
-        rhash_value = peers[rid].get('rhash') or ''
-        peers[rid]['has_rhash'] = _('是') if len(rhash_value) > 1 else _('否')
-        _normalize_device_item(peers[rid])
+    # Keep legacy address-book peers visible even before a device heartbeat has
+    # populated the modern owner relation.
+    for rid, item in legacy_peers.items():
+        rhash_value = item.get('rhash') or ''
+        item['has_rhash'] = _('是') if len(rhash_value) > 1 else _('否')
+        item['rust_user'] = user.username if user else ''
+        item['status'] = _('未知状态')
+        items[rid] = _normalize_device_item(item)
 
-    return [v for k, v in peers.items()]
+    return list(items.values())
 
 
 def get_all_info():

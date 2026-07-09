@@ -9,10 +9,9 @@
     <meta name="renderer" content="webkit">
     <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <meta name="theme-color" content="#397bff">
     <title>{{ "注册" | translate }}_【Camellia】</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="icon" type="image/svg+xml" href="{% static 'web_client/favicon.svg' %}">
     <link rel="stylesheet" href="{% static 'ui/app.css' %}">
 </head>
 <body class="auth-body">
@@ -20,7 +19,7 @@
     <div class="auth-hero">
       <div>
         <div class="auth-brand">
-          <div class="brand-mark">CM</div>
+          <div class="brand-mark"><img src="{% static 'web_client/favicon.svg' %}" alt="" aria-hidden="true"></div>
           <div class="brand-text">
             <span class="brand-title">Camellia</span>
             <span class="brand-subtitle">{{ "安全控制台" | translate }}</span>
