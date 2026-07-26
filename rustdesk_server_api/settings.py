@@ -48,6 +48,10 @@ CSRF_TRUSTED_ORIGINS = env_csv("CSRF_TRUSTED_ORIGINS", ["http://127.0.0.1:21114"
 # Relaxed so the bundled Flutter web client can complete popup-based OIDC flows.
 SECURE_CROSS_ORIGIN_OPENER_POLICY = None
 
+# Only enable behind a reverse proxy that overwrites X-Forwarded-For / X-Real-IP;
+# otherwise clients can choose the address the login lockout is keyed on.
+TRUST_PROXY_HEADERS = env_bool("TRUST_PROXY_HEADERS", False)
+
 # TLS-terminating deployments (reverse proxy or direct) should set SECURE_TLS=true.
 _secure_tls = env_bool("SECURE_TLS", False)
 SESSION_COOKIE_SECURE = _secure_tls

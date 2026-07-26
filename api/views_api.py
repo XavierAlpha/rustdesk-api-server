@@ -103,18 +103,20 @@ def _issue_access_token(user):
     The raw token is returned to the client exactly once; only its hash is stored.
     '''
     expires_at = timezone.now() + datetime.timedelta(seconds=EFFECTIVE_SECONDS)
-    token = RustDeskToken.objects.filter(Q(uid=str(user.id)) & Q(username=user.username) & Q(rid=user.rid)).first()
-    if not token:
-        token = RustDeskToken(
-            username=user.username,
-            uid=str(user.id),
-            uuid=user.uuid,
-            rid=user.rid,
-        )
     raw_token = secrets.token_urlsafe(32)
-    token.access_token = _hash_token(raw_token)
-    token.expires_at = expires_at
-    token.save()
+    # Keyed on the device, not just the user: update_or_create leans on the
+    # uniqueness constraint so two logins racing each other end with one row and
+    # one valid hash, rather than one live token nothing will ever revoke.
+    token, _created = RustDeskToken.objects.update_or_create(
+        uid=str(user.id),
+        rid=user.rid,
+        uuid=user.uuid,
+        defaults={
+            'username': user.username[:20],
+            'access_token': _hash_token(raw_token),
+            'expires_at': expires_at,
+        },
+    )
     return token, raw_token
 
 
@@ -130,6 +132,15 @@ def _auth_body(user, raw_token):
             'is_admin': True if user.is_admin else False,
             'email': user.email or '',
             'note': user.note or '',
+            # The desktop client's UserPayload requires `info`; without it the
+            # whole body fails to deserialise and the OIDC poll silently
+            # discards a successful login.
+            'info': {
+                'email_verification': False,
+                'email_alarm_notification': False,
+                'login_device_whitelist': [],
+                'other': {},
+            },
         },
     }
 
@@ -147,12 +158,23 @@ def _oidc_provider_name(op):
     return name
 
 def get_client_ip(request):
-    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-    if x_forwarded_for:
-        ip = x_forwarded_for.split(',')[0]
-    else:
-        ip = request.META.get('REMOTE_ADDR')
-    return ip
+    """Address to attribute a request to.
+
+    X-Forwarded-For is client-supplied unless something in front of us rewrites
+    it, so it is only trusted when the deployment opts in with TRUST_PROXY_HEADERS.
+    It keys the login lockout: trusting it unconditionally lets an attacker both
+    evade the lockout with a fresh value per attempt and lock out an arbitrary
+    victim by naming their address.
+    """
+    if getattr(settings, "TRUST_PROXY_HEADERS", False):
+        forwarded = request.META.get('HTTP_X_FORWARDED_FOR', '')
+        first = forwarded.split(',')[0].strip()
+        if first:
+            return first
+        real_ip = request.META.get('HTTP_X_REAL_IP', '').strip()
+        if real_ip:
+            return real_ip
+    return request.META.get('REMOTE_ADDR')
 
 
 def _log_event(request, event, level="info", **extra):
@@ -531,9 +553,14 @@ def logout(request):
         result = {'error': _('异常请求！')}
         _log_event(request, 'api_logout_failed', level="warning")
         return JsonResponse(result)
-    token = RustDeskToken.objects.filter(Q(uid=user.id) & Q(rid=user.rid)).first()
-    if token:
+    if token is not None:
+        # Revoke exactly the token that authenticated this request. UserProfile.rid
+        # holds whichever device logged in most recently, so looking the token up
+        # again by rid signs out a different device and leaves this one valid.
         token.delete()
+    elif rid and uuid:
+        # Unauthenticated fallback: the caller identified itself by device.
+        RustDeskToken.objects.filter(Q(uid=str(user.id)) & Q(rid=rid) & Q(uuid=uuid)).delete()
 
     result = {'code': 1}
     _log_event(request, 'api_logout_success', username=user.username, rid=user.rid)
@@ -1160,12 +1187,7 @@ def ab_shared_profiles(request):
     if not user:
         _log_event(request, 'api_ab_shared_profiles_unauthorized', level="warning")
         return JsonResponse({'error': 'Invalid token'}, status=401)
-    try:
-        current = int(request.GET.get('current', 1))
-        page_size = int(request.GET.get('pageSize', 100))
-    except Exception:
-        current = 1
-        page_size = 100
+    current, page_size, _start, _end = _pagination(request)
     items = {}
 
     def add_profile(p, rule_value):
@@ -1341,12 +1363,7 @@ def ab_rules(request):
     if not owner and not user.is_admin:
         _log_event(request, 'api_ab_rules_denied', level="warning", username=user.username, guid=guid)
         return JsonResponse({'error': 'No access'}, status=403)
-    try:
-        current = int(request.GET.get('current', 1))
-        page_size = int(request.GET.get('pageSize', 100))
-    except Exception:
-        current = 1
-        page_size = 100
+    current, page_size, _start, _end = _pagination(request)
     data = []
     shares = AddressBookShare.objects.filter(Q(profile=profile)).select_related('user')
     for share in shares:
@@ -1527,12 +1544,7 @@ def ab_peers(request):
     if not owner:
         _log_event(request, 'api_ab_peers_denied', level="warning", username=user.username, guid=guid)
         return JsonResponse({'error': 'No access'}, status=403)
-    try:
-        current = int(request.GET.get('current', 1))
-        page_size = int(request.GET.get('pageSize', 100))
-    except Exception:
-        current = 1
-        page_size = 100
+    current, page_size, _start, _end = _pagination(request)
     qs = RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(profile_guid=guid)).order_by('rid')
     total = qs.count()
     start = (current - 1) * page_size
@@ -2355,12 +2367,7 @@ def peers(request):
     if not user:
         _log_event(request, 'api_peers_unauthorized', level="warning")
         return JsonResponse({'error': 'Invalid token'}, status=401)
-    try:
-        current = int(request.GET.get('current', 1))
-        page_size = int(request.GET.get('pageSize', 100))
-    except Exception:
-        current = 1
-        page_size = 100
+    current, page_size, _start, _end = _pagination(request)
     if user.is_admin:
         device_qs = RustDesDevice.objects.all().select_related('owner').order_by('rid')
         peer_qs = RustDeskPeer.objects.all()

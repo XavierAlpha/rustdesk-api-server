@@ -23,6 +23,12 @@ class RustDeskToken(models.Model):
         ordering = ('-username',)
         verbose_name = _("令牌")
         verbose_name_plural = _("令牌列表")
+        constraints = [
+            # One live token per (user, device). Without this, two logins racing
+            # each other both insert, and rotation and logout only ever touch
+            # the first row - leaving the other hash valid indefinitely.
+            models.UniqueConstraint(fields=['uid', 'rid', 'uuid'], name='unique_token_per_device'),
+        ]
 
 
 class RustDeskTokenAdmin(admin.ModelAdmin):

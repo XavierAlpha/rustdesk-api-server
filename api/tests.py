@@ -409,3 +409,72 @@ class ApiContractTests(TestCase):
         self.assertEqual(items["765432100"]["platform"], "Linux")
         self.assertEqual(items["765432101"]["status"], "未知状态")
         self.assertEqual(home_response.context["summary"], {"total": 2, "online": 1, "offline": 0, "unknown": 1})
+
+
+class SessionIntegrityTests(ApiContractTests):
+    """Regressions for defects that let a session outlive its owner's intent."""
+
+    def test_logout_revokes_the_device_that_asked(self):
+        desktop = self._login("alice", "alice-pass", rid="111111111", uuid="desktop")
+        phone = self._login("alice", "alice-pass", rid="222222222", uuid="phone")
+        self.assertEqual(RustDeskToken.objects.filter(uid=str(self.user.id)).count(), 2)
+
+        logout = self._post_json("/api/logout", {"id": "111111111", "uuid": "desktop"}, token=desktop)
+        self.assertEqual(logout.status_code, 200, logout.content)
+
+        # The desktop is signed out ...
+        self.assertEqual(self._post_json("/api/currentUser", {}, token=desktop).status_code, 401)
+        # ... and the phone, which never asked, is still signed in.
+        self.assertEqual(self._post_json("/api/currentUser", {}, token=phone).status_code, 200)
+
+    def test_one_token_row_per_device(self):
+        first = self._login("alice", "alice-pass", rid="111111111", uuid="desktop")
+        second = self._login("alice", "alice-pass", rid="111111111", uuid="desktop")
+
+        # Re-login rotates in place instead of leaving an unrevokable second row.
+        self.assertEqual(
+            RustDeskToken.objects.filter(uid=str(self.user.id), rid="111111111", uuid="desktop").count(),
+            1,
+        )
+        self.assertEqual(self._post_json("/api/currentUser", {}, token=first).status_code, 401)
+        self.assertEqual(self._post_json("/api/currentUser", {}, token=second).status_code, 200)
+
+    def test_auth_body_carries_the_info_the_desktop_client_requires(self):
+        response = self._post_json(
+            "/api/login",
+            {"username": "alice", "password": "alice-pass", "id": "123456789", "uuid": "device-uuid"},
+        )
+        user = response.json()["user"]
+        # UserPayload has no default for `info`; omitting it makes the whole body
+        # fail to deserialise and silently discards a successful OIDC login.
+        self.assertIn("info", user)
+        self.assertIn("login_device_whitelist", user["info"])
+
+    @override_settings(TRUST_PROXY_HEADERS=False)
+    def test_forwarded_headers_cannot_choose_the_rate_limit_bucket(self):
+        # Every attempt claims a different forwarded address; with the header
+        # untrusted they all land in the same bucket and still trip the lockout.
+        for spoofed in range(10):
+            self.client.post(
+                "/api/login",
+                data=json.dumps({"username": "alice", "password": "wrong", "id": "1", "uuid": "u"}),
+                content_type="application/json",
+                HTTP_X_FORWARDED_FOR=f"198.51.100.{spoofed}",
+            )
+        locked = self.client.post(
+            "/api/login",
+            data=json.dumps({"username": "alice", "password": "alice-pass", "id": "1", "uuid": "u"}),
+            content_type="application/json",
+            HTTP_X_FORWARDED_FOR="203.0.113.9",
+        )
+        self.assertEqual(locked.status_code, 429)
+
+    def test_out_of_range_pagination_is_clamped(self):
+        token = self._login("alice", "alice-pass")
+        for query in ("current=0", "current=-5", "pageSize=-1", "current=0&pageSize=0"):
+            response = self.client.post(
+                f"/api/ab/peers?{query}",
+                content_type="application/json",
+                **self._auth_headers(token),
+            )
+            self.assertEqual(response.status_code, 200, f"{query}: {response.content}")
