@@ -1,4 +1,3 @@
-# cython:language_level=3
 from django.shortcuts import render
 from django.http import HttpResponseRedirect
 from django.contrib.auth.hashers import make_password

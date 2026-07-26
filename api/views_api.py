@@ -1,7 +1,7 @@
-# cython:language_level=3
 from django.http import JsonResponse, HttpResponse, HttpResponseRedirect
 import base64
 import binascii
+import hashlib
 import json
 import datetime
 import logging
@@ -27,6 +27,8 @@ from api.models import (
     AddressBookRuleAudit,
     AuditSession,
     AlarmLog,
+    OidcPendingAuth,
+    LoginAttempt,
 )
 from django.contrib.auth.models import Group
 from django.db import transaction
@@ -43,7 +45,9 @@ logger = logging.getLogger(__name__)
 EFFECTIVE_SECONDS = 7200
 MAX_DEPLOY_KEY_LEN = 512
 MAX_PLUGIN_SIGN_MSG_BYTES = 64 * 1024
-OIDC_PENDING = {}
+OIDC_PENDING_MINUTES = 5
+LOGIN_LOCK_MAX_FAILURES = 10
+LOGIN_LOCK_WINDOW_MINUTES = 15
 
 
 def _load_json(request):
@@ -62,11 +66,16 @@ def _get_bearer_token(request):
     return ''
 
 
+def _hash_token(raw_token):
+    '''Tokens are stored hashed at rest; DB access must not equal session takeover.'''
+    return hashlib.sha256(raw_token.encode()).hexdigest()
+
+
 def _get_token_user(request):
     token_str = _get_bearer_token(request)
     if not token_str:
         return None, None
-    token = RustDeskToken.objects.filter(Q(access_token=token_str)).first()
+    token = RustDeskToken.objects.filter(Q(access_token=_hash_token(token_str))).first()
     if not token:
         return None, None
     if _token_expired(token):
@@ -89,27 +98,29 @@ def _token_expired(token):
 
 
 def _issue_access_token(user):
+    '''Create or rotate the token for this (user, device); returns (token, raw_token).
+
+    The raw token is returned to the client exactly once; only its hash is stored.
+    '''
     expires_at = timezone.now() + datetime.timedelta(seconds=EFFECTIVE_SECONDS)
     token = RustDeskToken.objects.filter(Q(uid=str(user.id)) & Q(username=user.username) & Q(rid=user.rid)).first()
-    if token and _token_expired(token):
-        token.delete()
-        token = None
     if not token:
         token = RustDeskToken(
             username=user.username,
             uid=str(user.id),
             uuid=user.uuid,
             rid=user.rid,
-            access_token=secrets.token_urlsafe(32),
         )
+    raw_token = secrets.token_urlsafe(32)
+    token.access_token = _hash_token(raw_token)
     token.expires_at = expires_at
     token.save()
-    return token
+    return token, raw_token
 
 
-def _auth_body(user, token):
+def _auth_body(user, raw_token):
     return {
-        'access_token': token.access_token,
+        'access_token': raw_token,
         'type': 'access_token',
         'user': {
             'name': user.username,
@@ -411,12 +422,23 @@ def _upsert_ab_peer(owner, guid, rid, data, is_personal):
     return peer
 
 
+def _login_locked(ip):
+    window_start = timezone.now() - datetime.timedelta(minutes=LOGIN_LOCK_WINDOW_MINUTES)
+    return LoginAttempt.objects.filter(Q(ip=ip) & Q(created_at__gte=window_start)).count() >= LOGIN_LOCK_MAX_FAILURES
+
+
+def _record_login_failure(ip, username):
+    LoginAttempt.objects.create(ip=ip or '', username=username[:150])
+    # Opportunistic cleanup keeps the table tiny without a scheduled job.
+    window_start = timezone.now() - datetime.timedelta(minutes=LOGIN_LOCK_WINDOW_MINUTES)
+    LoginAttempt.objects.filter(created_at__lt=window_start).delete()
+
+
 def login(request):
     result = {}
-    if request.method == 'GET':
-        result['error'] = _('请求方式错误！请使用POST方式。')
+    if request.method != 'POST':
         _log_event(request, 'api_login_invalid_method', level="warning")
-        return JsonResponse(result)
+        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')}, status=405)
 
     data = _load_json(request)
 
@@ -427,6 +449,10 @@ def login(request):
     autoLogin = data.get('autoLogin', True)
     rtype = data.get('type', '')
     deviceInfo = data.get('deviceInfo', '')
+    client_ip = get_client_ip(request)
+    if _login_locked(client_ip):
+        _log_event(request, 'api_login_locked', level="warning", username=username)
+        return JsonResponse({'error': _('尝试次数过多，请稍后再试。')}, status=429)
     user = auth.authenticate(username=username, password=password)
     if not user:
         candidate = UserProfile.objects.filter(Q(username__iexact=username)).first()
@@ -434,10 +460,11 @@ def login(request):
             candidate.backend = 'django.contrib.auth.backends.ModelBackend'
             user = candidate
         else:
+            _record_login_failure(client_ip, username)
             result['error'] = _('帐号或密码错误！请重试，多次重试后将被锁定IP！')
             reason = 'password_mismatch' if candidate else 'user_not_found'
             _log_event(request, 'api_login_failed', level="warning", username=username, reason=reason)
-            return JsonResponse(result)
+            return JsonResponse(result, status=401)
     if not user.is_active:
         _log_event(request, 'api_login_denied', level="warning", username=username, reason='inactive')
         return JsonResponse({'error': _('账号已被禁用')}, status=403)
@@ -464,7 +491,8 @@ def login(request):
             device.owner_name = user.username
         device.save()
 
-    token = _issue_access_token(user)
+    token, raw_token = _issue_access_token(user)
+    LoginAttempt.objects.filter(Q(ip=client_ip)).delete()
 
     if rid:
         personal_guid = _personal_guid(user)
@@ -482,7 +510,7 @@ def login(request):
                 profile_guid=personal_guid,
             )
 
-    result.update(_auth_body(user, token))
+    result.update(_auth_body(user, raw_token))
     _log_event(request, 'api_login_success', username=user.username, rid=rid)
     return JsonResponse(result)
 
@@ -528,7 +556,8 @@ def currentUser(request):
         _log_event(request, 'api_current_user_failed', level="warning")
         return JsonResponse({'error': 'Invalid token'}, status=401)
     if token:
-        result['access_token'] = token.access_token
+        # Tokens are stored hashed; echo back the raw token the client presented.
+        result['access_token'] = _get_bearer_token(request)
     result['type'] = 'access_token'
     result['name'] = user.username
     result['status'] = 1 if user.is_active else 0
@@ -675,7 +704,14 @@ def heartbeat(request):
         device.ip_address = client_ip
         device.save()
     else:
-        # create a placeholder device to avoid repeated ID_NOT_FOUND
+        # Create a placeholder device to avoid repeated ID_NOT_FOUND, but only
+        # for well-formed identifiers: this endpoint is unauthenticated and must
+        # not be a vector for filling the device table with junk rows.
+        rid_value = str(postdata['id'])
+        uuid_value = str(postdata['uuid'])
+        if len(rid_value) > 16 or len(uuid_value) > 60 or not rid_value.isprintable():
+            _log_event(request, 'api_heartbeat_malformed_id', level="warning")
+            return JsonResponse({'error': 'ID_NOT_FOUND'})
         device = RustDesDevice(
             rid=postdata['id'],
             cpu='-',
@@ -758,53 +794,54 @@ def oidc_auth(request):
         _log_event(request, 'api_oidc_auth_failed', level="warning", op=provider_name, error=str(exc))
         return JsonResponse({'error': 'Failed to initialize OIDC authorization'}, status=502)
     now = timezone.now()
-    stale_states = [
-        key for key, value in OIDC_PENDING.items()
-        if now - value.get("created_at", now) > datetime.timedelta(minutes=5)
-    ]
-    for key in stale_states:
-        OIDC_PENDING.pop(key, None)
-    OIDC_PENDING[state] = {
-        "provider": provider_name,
-        "created_at": now,
-        "id": str(data.get("id", "")),
-        "uuid": str(data.get("uuid", "")),
-        "deviceInfo": data.get("deviceInfo", ""),
-        "status": "pending",
-    }
+    OidcPendingAuth.objects.filter(
+        created_at__lt=now - datetime.timedelta(minutes=OIDC_PENDING_MINUTES)
+    ).delete()
+    device_info = data.get("deviceInfo", "")
+    OidcPendingAuth.objects.create(
+        state=state,
+        provider=provider_name,
+        rid=str(data.get("id", ""))[:16],
+        device_uuid=str(data.get("uuid", ""))[:60],
+        device_info=json.dumps(device_info, ensure_ascii=False)
+        if isinstance(device_info, (dict, list))
+        else str(device_info),
+        status=OidcPendingAuth.STATUS_PENDING,
+    )
     _log_event(request, 'api_oidc_auth_created', level="debug", op=provider_name)
     return JsonResponse({'code': state, 'url': auth_url})
 
 
 def oidc_auth_query(request):
     state = str(request.GET.get('code', '')).strip()
-    session = OIDC_PENDING.get(state)
+    session = OidcPendingAuth.objects.filter(Q(state=state)).first() if state else None
     if not session:
         return JsonResponse({'error': 'No authed oidc is found'})
-    if timezone.now() - session["created_at"] > datetime.timedelta(minutes=3):
-        OIDC_PENDING.pop(state, None)
+    if timezone.now() - session.created_at > datetime.timedelta(minutes=3):
+        session.delete()
         return JsonResponse({'error': 'OIDC authorization timeout'}, status=408)
-    if session.get("status") == "error":
-        error = session.get("error", "OIDC authorization failed")
-        OIDC_PENDING.pop(state, None)
+    if session.status == OidcPendingAuth.STATUS_ERROR:
+        error = session.error or 'OIDC authorization failed'
+        session.delete()
         return JsonResponse({'error': error}, status=400)
-    if session.get("status") != "done":
+    if session.status != OidcPendingAuth.STATUS_DONE:
         return JsonResponse({'error': 'No authed oidc is found'})
-    body = session.get("body") or {}
-    OIDC_PENDING.pop(state, None)
+    body = session.body or {}
+    session.delete()
     return JsonResponse(body)
 
 
 def oidc_callback(request):
     state = str(request.GET.get('state', '')).strip()
     code = str(request.GET.get('code', '')).strip()
-    session = OIDC_PENDING.get(state)
+    session = OidcPendingAuth.objects.filter(Q(state=state)).first() if state else None
     if not state or not code or not session:
         return HttpResponse('Invalid OIDC callback', status=400)
-    provider = getattr(settings, "OIDC_PROVIDERS", {}).get(session["provider"])
+    provider = getattr(settings, "OIDC_PROVIDERS", {}).get(session.provider)
     if not provider:
-        session["status"] = "error"
-        session["error"] = "OIDC provider is not configured"
+        session.status = OidcPendingAuth.STATUS_ERROR
+        session.error = "OIDC provider is not configured"
+        session.save(update_fields=['status', 'error'])
         return HttpResponse('OIDC provider is not configured', status=400)
     try:
         client = OAuth2Session(
@@ -830,20 +867,21 @@ def oidc_callback(request):
             user.email = email
         if created:
             user.set_unusable_password()
-        user.rid = session.get("id", "")
-        user.uuid = session.get("uuid", "")
-        device_info = session.get("deviceInfo", "")
-        user.deviceInfo = json.dumps(device_info, ensure_ascii=False) if isinstance(device_info, (dict, list)) else str(device_info)
+        user.rid = session.rid
+        user.uuid = session.device_uuid
+        user.deviceInfo = session.device_info
         user.save()
         if not user.is_active:
             raise PermissionError("Account is disabled")
-        token = _issue_access_token(user)
-        session["body"] = _auth_body(user, token)
-        session["status"] = "done"
+        token, raw_token = _issue_access_token(user)
+        session.body = _auth_body(user, raw_token)
+        session.status = OidcPendingAuth.STATUS_DONE
+        session.save(update_fields=['body', 'status'])
         _log_event(request, 'api_oidc_callback_success', username=user.username)
     except Exception as exc:
-        session["status"] = "error"
-        session["error"] = str(exc)
+        session.status = OidcPendingAuth.STATUS_ERROR
+        session.error = str(exc)
+        session.save(update_fields=['status', 'error'])
         _log_event(request, 'api_oidc_callback_failed', level="warning", error=str(exc))
         return HttpResponse('OIDC authorization failed', status=400)
     return HttpResponse('OIDC authorization completed. You can close this window.')

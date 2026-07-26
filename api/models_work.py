@@ -1,4 +1,3 @@
-# cython:language_level=3
 import uuid
 from django.db import models
 from django.contrib import admin
@@ -326,6 +325,48 @@ class AlarmLog(models.Model):
 
     def __str__(self):
         return f"Alarm {self.typ} #{self.pk}"
+
+
+class OidcPendingAuth(models.Model):
+    '''Pending OIDC authorization state, shared across workers.'''
+
+    STATUS_PENDING = 'pending'
+    STATUS_DONE = 'done'
+    STATUS_ERROR = 'error'
+
+    state = models.CharField(verbose_name='State', max_length=64, primary_key=True)
+    provider = models.CharField(verbose_name='Provider', max_length=64)
+    rid = models.CharField(verbose_name='Camellia ID', max_length=16, blank=True, default='')
+    device_uuid = models.CharField(verbose_name='Device UUID', max_length=60, blank=True, default='')
+    device_info = models.TextField(verbose_name='Device Info', blank=True, default='')
+    status = models.CharField(verbose_name='Status', max_length=16, default=STATUS_PENDING, db_index=True)
+    error = models.TextField(verbose_name='Error', blank=True, default='')
+    body = models.JSONField(verbose_name='Auth Body', null=True, blank=True)
+    created_at = models.DateTimeField(verbose_name='Created At', auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ('-created_at',)
+        verbose_name = _("OIDC待处理授权")
+        verbose_name_plural = _("OIDC待处理授权列表")
+
+    def __str__(self):
+        return f"{self.provider}:{self.state[:8]}…"
+
+
+class LoginAttempt(models.Model):
+    '''Failed credential login, kept briefly for IP rate limiting.'''
+
+    ip = models.CharField(verbose_name='IP', max_length=64, db_index=True)
+    username = models.CharField(verbose_name='用户名', max_length=150, blank=True, default='')
+    created_at = models.DateTimeField(verbose_name='Created At', auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ('-created_at',)
+        verbose_name = _("失败登录")
+        verbose_name_plural = _("失败登录列表")
+
+    def __str__(self):
+        return f"{self.ip} {self.username}"
 
 
 class ShareLinkAdmin(admin.ModelAdmin):

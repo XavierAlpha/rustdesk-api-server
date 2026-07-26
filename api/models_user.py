@@ -1,4 +1,3 @@
-# cython:language_level=3
 from django.db import models
 from django.contrib.auth.models import (
     BaseUserManager,AbstractBaseUser,PermissionsMixin

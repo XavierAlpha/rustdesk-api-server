@@ -1,4 +1,3 @@
-# cython:language_level=3
 from django.contrib import admin
 from api import models
 from django import forms

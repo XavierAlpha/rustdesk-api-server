@@ -1,8 +1,18 @@
+import hashlib
 import json
 
 from django.test import TestCase, override_settings
 
-from api.models import DeviceGroup, RustDesDevice, RustDeskPeer, StrategyProfile, UserProfile
+from api.models import (
+    DeviceGroup,
+    LoginAttempt,
+    OidcPendingAuth,
+    RustDesDevice,
+    RustDeskPeer,
+    RustDeskToken,
+    StrategyProfile,
+    UserProfile,
+)
 
 
 class ApiContractTests(TestCase):
@@ -92,6 +102,126 @@ class ApiContractTests(TestCase):
         response = self._post_json("/api/currentUser", {}, token=token)
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(response.json()["name"], "alice")
+
+    def test_failed_login_returns_401_with_error_body(self):
+        response = self._post_json(
+            "/api/login",
+            {"username": "alice", "password": "wrong", "id": "123456789", "uuid": "device-uuid"},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("error", response.json())
+        self.assertEqual(LoginAttempt.objects.filter(ip="127.0.0.1").count(), 1)
+
+    def test_repeated_login_failures_lock_out_ip(self):
+        for _ in range(10):
+            self._post_json(
+                "/api/login",
+                {"username": "alice", "password": "wrong", "id": "123456789", "uuid": "device-uuid"},
+            )
+        locked = self._post_json(
+            "/api/login",
+            {"username": "alice", "password": "alice-pass", "id": "123456789", "uuid": "device-uuid"},
+        )
+        self.assertEqual(locked.status_code, 429)
+        self.assertIn("error", locked.json())
+
+    def test_successful_login_clears_failures_and_stores_hashed_token(self):
+        self._post_json(
+            "/api/login",
+            {"username": "alice", "password": "wrong", "id": "123456789", "uuid": "device-uuid"},
+        )
+        token = self._login("alice", "alice-pass")
+        self.assertEqual(LoginAttempt.objects.count(), 0)
+
+        stored = RustDeskToken.objects.get(uid=str(self.user.id))
+        self.assertNotEqual(stored.access_token, token)
+        self.assertEqual(stored.access_token, hashlib.sha256(token.encode()).hexdigest())
+
+        # currentUser echoes the presented raw token, never the stored hash.
+        response = self._post_json("/api/currentUser", {}, token=token)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["access_token"], token)
+
+    def test_relogin_rotates_the_stored_token(self):
+        first = self._login("alice", "alice-pass")
+        second = self._login("alice", "alice-pass")
+        self.assertNotEqual(first, second)
+
+        stale = self._post_json("/api/currentUser", {}, token=first)
+        self.assertEqual(stale.status_code, 401)
+        fresh = self._post_json("/api/currentUser", {}, token=second)
+        self.assertEqual(fresh.status_code, 200, fresh.content)
+
+    def test_oidc_auth_query_reads_state_from_database(self):
+        # Simulates the callback having completed on a different worker: the
+        # pending state lives in the DB, not in process memory.
+        OidcPendingAuth.objects.create(
+            state="test-state",
+            provider="example",
+            status=OidcPendingAuth.STATUS_DONE,
+            body={"access_token": "raw-token", "type": "access_token"},
+        )
+        response = self.client.get("/api/oidc/auth-query?code=test-state")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["access_token"], "raw-token")
+        self.assertFalse(OidcPendingAuth.objects.filter(state="test-state").exists())
+
+    def test_heartbeat_rejects_malformed_placeholder_ids(self):
+        response = self._post_json(
+            "/api/heartbeat",
+            {"id": "x" * 200, "uuid": "device-uuid"},
+        )
+        self.assertEqual(response.json().get("error"), "ID_NOT_FOUND")
+        self.assertFalse(RustDesDevice.objects.exists())
+
+        ok = self._post_json("/api/heartbeat", {"id": "123456789", "uuid": "device-uuid"})
+        self.assertEqual(ok.status_code, 200, ok.content)
+        self.assertTrue(RustDesDevice.objects.filter(rid="123456789").exists())
+
+    def test_address_book_peers_match_flutter_client_contract(self):
+        token = self._login("alice", "alice-pass")
+        RustDeskPeer.objects.create(
+            uid=str(self.user.id),
+            rid="765432100",
+            username="mira",
+            hostname="studio-mac",
+            platform="Mac OS",
+            alias="Design workstation",
+            tags="studio,trusted",
+            note="Primary workstation",
+            device_group_name="Design",
+            login_name="mira@example.test",
+            same_server=True,
+            rhash="personal-hash",
+            profile_guid=f"personal-{self.user.id}",
+        )
+
+        response = self.client.post(
+            "/api/ab/peers?current=1&pageSize=100",
+            data="",
+            content_type="application/json",
+            **self._auth_headers(token),
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["total"], 1)
+        self.assertEqual(
+            response.json()["data"][0],
+            {
+                "id": "765432100",
+                "username": "mira",
+                "hostname": "studio-mac",
+                "platform": "Mac OS",
+                "alias": "Design workstation",
+                "tags": ["studio", "trusted"],
+                "note": "Primary workstation",
+                "device_group_name": "Design",
+                "loginName": "mira@example.test",
+                "same_server": True,
+                "hash": "personal-hash",
+                "password": "",
+            },
+        )
 
     def test_admin_can_manage_users_and_disabled_users_cannot_login(self):
         admin_token = self._login("admin", "admin-pass", rid="900000001", uuid="admin-device")
