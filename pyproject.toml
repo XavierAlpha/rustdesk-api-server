@@ -1,5 +1,35 @@
+[project]
+name = "camellia-api-server"
+version = "3.3.16"
+description = "Camellia API server: accounts, address books, device management and web console for the Camellia remote desktop suite"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "django>=6.0,<7.0",
+  "openpyxl>=3.1,<4",
+  "gunicorn>=26,<27",
+  "whitenoise>=6.12,<7",
+  "authlib>=1.7,<2",
+  "requests>=2.32,<3",
+  "pynacl>=1.6,<2",
+]
+
+[project.optional-dependencies]
+mysql = ["mysqlclient>=2.2,<3"]
+
+[dependency-groups]
+dev = [
+  "ruff>=0.15,<0.16",
+  "pytest>=9,<10",
+  "pytest-django>=4.12,<5",
+  "coverage>=7.15,<8",
+]
+
+[tool.uv]
+package = false
+
 [tool.ruff]
-target-version = "py314"
+target-version = "py313"
 line-length = 120
 extend-exclude = [
   "static",

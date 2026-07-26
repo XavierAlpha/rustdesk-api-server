@@ -45,7 +45,16 @@ if not SECRET_KEY:
 DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 ALLOWED_HOSTS = env_csv("ALLOWED_HOSTS", ["127.0.0.1", "localhost"])
 CSRF_TRUSTED_ORIGINS = env_csv("CSRF_TRUSTED_ORIGINS", ["http://127.0.0.1:21114"])
+# Relaxed so the bundled Flutter web client can complete popup-based OIDC flows.
 SECURE_CROSS_ORIGIN_OPENER_POLICY = None
+
+# TLS-terminating deployments (reverse proxy or direct) should set SECURE_TLS=true.
+_secure_tls = env_bool("SECURE_TLS", False)
+SESSION_COOKIE_SECURE = _secure_tls
+CSRF_COOKIE_SECURE = _secure_tls
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https") if _secure_tls else None
+SECURE_HSTS_SECONDS = env_int("SECURE_HSTS_SECONDS", 0, 0, 63072000)
+SESSION_COOKIE_HTTPONLY = True
 AUTH_USER_MODEL = "api.UserProfile"
 
 ID_SERVER = os.environ.get("ID_SERVER", "").strip()
