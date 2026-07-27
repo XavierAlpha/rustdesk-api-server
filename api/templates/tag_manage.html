@@ -53,7 +53,7 @@
       {% endfor %}
     </select>
     <input class="ab-input" type="text" name="name" placeholder="{% trans "标签名称" %}">
-    <input class="ab-input" type="text" name="color" placeholder="{% trans "颜色（可选）" %}">
+    <input class="ab-input ab-color-input" type="color" name="color" value="#397bff" aria-label="{% trans "标签颜色" %}">
     <button class="btn btn-primary btn-xs" type="submit">{% trans "新增" %}</button>
   </form>
 </div>
@@ -83,7 +83,9 @@
           <div class="info-item">
             <span>{% trans "颜色" %}</span>
             <strong>
-              <span class="ab-tag-dot" style="background-color: {{ tag.color|default:'#94a3b8' }}"></span>
+              <svg class="ab-tag-dot" viewBox="0 0 16 16" aria-hidden="true">
+                <circle cx="8" cy="8" r="8" fill="{{ tag.css_color }}"></circle>
+              </svg>
               {{ tag.color|default:"-" }}
             </strong>
           </div>
@@ -101,7 +103,7 @@
               <input type="hidden" name="name" value="{{ tag.name }}">
               <div class="action-title">{% trans "颜色" %}</div>
               <div class="action-row">
-                <input class="ab-input" type="text" name="color" value="{{ tag.color }}" placeholder="{% trans "颜色" %}">
+                <input class="ab-input ab-color-input" type="color" name="color" value="{{ tag.css_color }}" aria-label="{% trans "标签颜色" %}">
                 <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
               </div>
             </form>

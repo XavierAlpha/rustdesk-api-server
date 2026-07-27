@@ -1423,6 +1423,13 @@ a {
   width: 10px;
   height: 10px;
   border-radius: 999px;
+  flex: 0 0 auto;
+  vertical-align: middle;
+}
+
+.ab-color-input {
+  min-width: 52px;
+  padding: 4px;
 }
 
 .ab-peer-list {
@@ -1505,15 +1512,23 @@ a {
 }
 
 .ab-chart-bar {
+  appearance: none;
+  display: block;
+  width: 100%;
   background: rgba(15, 23, 42, 0.08);
+  border: 0;
   border-radius: 999px;
   height: 10px;
   overflow: hidden;
 }
 
-.ab-chart-bar span {
-  display: block;
-  height: 100%;
+.ab-chart-bar::-webkit-progress-bar {
+  background: rgba(15, 23, 42, 0.08);
+  border-radius: 999px;
+}
+
+.ab-chart-bar::-webkit-progress-value,
+.ab-chart-bar::-moz-progress-bar {
   border-radius: 999px;
   background: linear-gradient(90deg, #22c55e, #3b82f6);
 }
@@ -2456,10 +2471,6 @@ a {
 .ab-peer-row,
 .rule-card {
   background: var(--surface);
-}
-
-.ab-chart-bar {
-  background: linear-gradient(90deg, var(--aqua), var(--azure), var(--orchid));
 }
 
 .auth-body {

@@ -127,7 +127,7 @@
     </div>
   </div>
 
-  <script>
+  <script nonce="{{ csp_nonce }}">
     (function () {
       var idServerNode = document.querySelector('[data-status="id-server"]');
       var relayServerNode = document.querySelector('[data-status="relay-server"]');
@@ -189,15 +189,15 @@
           setStatus(userNode, '{% trans "无法读取" %}', 'is-bad');
         });
 
-      fetch('/api/sysinfo_ver', { credentials: 'same-origin' })
+      fetch('/health/ready', { credentials: 'same-origin' })
         .then(function (res) {
           if (!res.ok) {
             throw new Error('api');
           }
-          return res.text();
+          return res.json();
         })
-        .then(function (text) {
-          if (text && text.trim() === '1') {
+        .then(function (payload) {
+          if (payload && payload.status === 'ready') {
             setStatus(apiNode, '{% trans "在线" %}', 'is-ok');
             setButton(secondaryCta, '{% trans "网络状态良好" %}');
           } else {
@@ -216,14 +216,14 @@
     })();
   </script>
 
-  <script>
+  <script nonce="{{ csp_nonce }}">
     window.api = ["{{ domain|escapejs }}"];
     window.__CAMELLIA_WEB__ = Object.assign({}, window.__CAMELLIA_WEB__ || {}, {
       appName: "Camellia",
       apiServer: "{{ api_server|escapejs }}",
       rsPubKey: "{{ rs_pub_key|escapejs }}",
-      rendezvousServers: {{ id_servers_json|safe }},
-      relayServers: {{ relay_servers_json|safe }},
+      rendezvousServers: JSON.parse("{{ id_servers_json|escapejs }}"),
+      relayServers: JSON.parse("{{ relay_servers_json|escapejs }}"),
       env: {
         API_SERVER: "{{ api_server|escapejs }}",
         RS_PUB_KEY: "{{ rs_pub_key|escapejs }}",

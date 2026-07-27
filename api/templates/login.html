@@ -42,7 +42,7 @@
         </div>
         <div class="form-field">
           <label for="password">{{ "密码" | translate }}</label>
-          <input id="password" type="password" name="password" autocomplete="current-password" required placeholder="{{ "请输入密码" | translate }}">
+          <input id="password" type="password" name="password" autocomplete="current-password" maxlength="128" required placeholder="{{ "请输入密码" | translate }}">
         </div>
         <button type="submit" class="btn btn-primary" style="width: 100%;">{{ "登录" | translate }}</button>
       </form>
@@ -53,7 +53,7 @@
     </div>
   </div>
 
-  <script>
+  <script nonce="{{ csp_nonce }}">
     const messageEl = document.getElementById('form-message');
     const form = document.getElementById('login-form');
     const getCookie = (name) => {

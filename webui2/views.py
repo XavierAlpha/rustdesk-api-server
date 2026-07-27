@@ -1,11 +1,22 @@
 import json
-from urllib.parse import urlparse
+from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from django.conf import settings as _settings
 from django.contrib.auth.decorators import login_required
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
+
+
+@dataclass(frozen=True)
+class _ServerEndpoint:
+    scheme: str | None
+    host: str
+    port: int | None
+    path: str = ""
+    query: str = ""
+
 
 def _clamp_port(value: int) -> int:
     if value <= 0:
@@ -57,11 +68,22 @@ def _strip_ipv6_brackets(host: str) -> str:
     return host
 
 
-def _format_ws_endpoint(scheme: str, host: str, port: int) -> str:
+def _format_ws_endpoint(
+    scheme: str,
+    host: str,
+    port: int,
+    path: str = "",
+    query: str = "",
+) -> str:
     host = _strip_ipv6_brackets(host)
     if ":" in host:
         host = f"[{host}]"
-    return f"{scheme}://{host}:{port}"
+    suffix = path if path and path != "/" else ""
+    if suffix and not suffix.startswith("/"):
+        suffix = f"/{suffix}"
+    if query:
+        suffix = f"{suffix}?{query}"
+    return f"{scheme}://{host}:{port}{suffix}"
 
 
 def _format_host_port(host: str, port: int) -> str:
@@ -71,15 +93,17 @@ def _format_host_port(host: str, port: int) -> str:
     return f"{host}:{port}"
 
 
-def _parse_server_input(server: str):
+def _parse_server_input(server: str) -> _ServerEndpoint | None:
     server = (server or "").strip()
-    if not server:
+    if not server or len(server) > 2048 or any(character.isspace() for character in server):
         return None
     if "://" in server:
         try:
-            parsed = urlparse(server)
+            parsed = urlsplit(server)
             scheme = (parsed.scheme or "").lower()
             if scheme not in ("ws", "wss"):
+                return None
+            if parsed.username is not None or parsed.password is not None or parsed.fragment:
                 return None
             host = (parsed.hostname or "").strip()
             if not host:
@@ -89,9 +113,17 @@ def _parse_server_input(server: str):
             except ValueError:
                 return None
             host = _strip_ipv6_brackets(host)
-            return scheme, host, port
-        except Exception:
+            return _ServerEndpoint(
+                scheme=scheme,
+                host=host,
+                port=port,
+                path=parsed.path if parsed.path != "/" else "",
+                query=parsed.query,
+            )
+        except ValueError:
             return None
+    if any(character in server for character in "/?#"):
+        return None
     if server.startswith("["):
         end = server.find("]")
         if end <= 0:
@@ -99,7 +131,7 @@ def _parse_server_input(server: str):
         host = _strip_ipv6_brackets(server[1:end])
         rest = server[end + 1:]
         if not rest:
-            return None, host, None
+            return _ServerEndpoint(None, host, None)
         if not rest.startswith(":"):
             return None
         try:
@@ -108,7 +140,7 @@ def _parse_server_input(server: str):
             return None
         if port <= 0 or port > 65535:
             return None
-        return None, host, port
+        return _ServerEndpoint(None, host, port)
     colon_count = server.count(":")
     if colon_count == 1:
         host, port_text = server.rsplit(":", 1)
@@ -121,39 +153,55 @@ def _parse_server_input(server: str):
         if port <= 0 or port > 65535:
             return None
         host = _strip_ipv6_brackets(host)
-        return None, host, port
+        return _ServerEndpoint(None, host, port)
     host = _strip_ipv6_brackets(server)
     if not host:
         return None
-    return None, host, None
+    return _ServerEndpoint(None, host, None)
 
 
 def _normalize_rendezvous_server(server: str) -> str:
     parsed = _parse_server_input(server)
     if not parsed:
         return ""
-    scheme, host, port = parsed
-    if scheme and scheme not in ("ws", "wss"):
-        return ""
-    if scheme == "ws":
-        base_port = port or _default_id_port()
-        return _format_ws_endpoint("ws", host, base_port)
-    if scheme == "wss":
-        base_port = port or _default_id_port()
-        return _format_ws_endpoint("wss", host, base_port)
-    return _format_host_port(host, port or _default_id_port())
+    if parsed.scheme:
+        websocket_port = parsed.port or _offset_port(_default_id_port(), 2)
+        default_path = "/ws/id" if parsed.scheme == "wss" else ""
+        return _format_ws_endpoint(
+            parsed.scheme,
+            parsed.host,
+            websocket_port,
+            parsed.path or default_path,
+            parsed.query,
+        )
+    return _format_host_port(parsed.host, parsed.port or _default_id_port())
 
 
 def _derive_relay_server(rendezvous_endpoint: str) -> str:
     parsed = _parse_server_input(rendezvous_endpoint)
     if not parsed:
         return ""
-    scheme, host, port = parsed
-    if not scheme:
-        return _format_host_port(host, _offset_port(port or _default_id_port(), 1))
-    if scheme in ("wss", "ws"):
-        return _format_ws_endpoint(scheme, host, _offset_port(port or _default_id_port(), 1))
-    return ""
+    if not parsed.scheme:
+        return _format_host_port(
+            parsed.host,
+            _offset_port(parsed.port or _default_id_port(), 1),
+        )
+    websocket_port = parsed.port or _offset_port(_default_id_port(), 2)
+    if parsed.scheme == "wss":
+        # A WSS endpoint is a TLS reverse-proxy origin. Rendezvous and relay
+        # share the HTTPS port and are selected by path.
+        return _format_ws_endpoint(
+            "wss",
+            parsed.host,
+            websocket_port,
+            "/ws/relay",
+            parsed.query,
+        )
+    return _format_ws_endpoint(
+        "ws",
+        parsed.host,
+        _offset_port(websocket_port, 1),
+    )
 
 
 def _normalize_relay_server(
@@ -163,25 +211,47 @@ def _normalize_relay_server(
     parsed = _parse_server_input(server)
     if not parsed:
         return ""
-    scheme, host, port = parsed
     fallback = _parse_server_input(rendezvous_endpoint)
-    fallback_scheme = fallback[0] if fallback else None
-    fallback_port = fallback[2] if fallback else None
-    if scheme and scheme not in ("ws", "wss"):
-        return ""
-    if scheme in ("ws", "wss"):
-        base = (
-            fallback_port or _default_id_port()
-            if fallback_scheme in ("ws", "wss")
-            else _default_id_port()
+    if parsed.scheme == "wss":
+        if parsed.port:
+            port = parsed.port
+        elif fallback and fallback.scheme == "wss":
+            port = fallback.port or _offset_port(_default_id_port(), 2)
+        else:
+            port = _offset_port(_default_id_port(), 3)
+        return _format_ws_endpoint(
+            "wss",
+            parsed.host,
+            port,
+            parsed.path or "/ws/relay",
+            parsed.query,
         )
-        return _format_ws_endpoint(scheme, host, port or _offset_port(base, 1))
+    if parsed.scheme == "ws":
+        if parsed.port:
+            port = parsed.port
+        elif fallback and fallback.scheme == "ws":
+            port = _offset_port(
+                fallback.port or _offset_port(_default_id_port(), 2),
+                1,
+            )
+        else:
+            port = _offset_port(_default_id_port(), 3)
+        return _format_ws_endpoint(
+            "ws",
+            parsed.host,
+            port,
+            parsed.path,
+            parsed.query,
+        )
     base_service_port = (
-        fallback_port or _default_id_port()
-        if fallback and not fallback_scheme
+        fallback.port or _default_id_port()
+        if fallback and not fallback.scheme
         else _default_id_port()
     )
-    return _format_host_port(host, port or _offset_port(base_service_port, 1))
+    return _format_host_port(
+        parsed.host,
+        parsed.port or _offset_port(base_service_port, 1),
+    )
 
 
 def _resolve_webui2_servers():

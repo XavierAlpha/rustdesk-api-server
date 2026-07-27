@@ -90,9 +90,12 @@
             <div class="ab-chart-title">{{ item.name }}</div>
             <div class="ab-chart-meta">{{ item.owner }} · {{ item.peers }} {% trans "台设备" %}</div>
           </div>
-          <div class="ab-chart-bar">
-            <span style="width: {{ item.peers_pct }}%"></span>
-          </div>
+          <progress
+            class="ab-chart-bar"
+            max="100"
+            value="{{ item.peers_pct }}"
+            aria-label="{{ item.name }} {{ item.peers_pct }}%"
+          >{{ item.peers_pct }}%</progress>
         </div>
       {% empty %}
         <div class="ab-empty">{% trans "暂无数据" %}</div>

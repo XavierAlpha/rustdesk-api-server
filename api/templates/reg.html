@@ -29,7 +29,7 @@
         <p>{{ "注册后即可通过 Web 管理界面统一管理设备与日志。" | translate }}</p>
       </div>
       <div class="notice">
-        {{ "密码长度建议 8~20 位，可包含字母、数字或特殊字符。" | translate }}
+        {{ "请使用至少 8 位且不常见的密码或长密码短语。" | translate }}
       </div>
     </div>
     <div class="auth-card">
@@ -43,11 +43,11 @@
         </div>
         <div class="form-field">
           <label for="pwd">{{ "密码" | translate }}</label>
-          <input type="password" id="pwd" name="pwd" autocomplete="new-password" required placeholder="{{ "请输入密码" | translate }}">
+          <input type="password" id="pwd" name="pwd" autocomplete="new-password" minlength="8" maxlength="128" required placeholder="{{ "请输入密码" | translate }}">
         </div>
         <div class="form-field">
           <label for="rpwd">{{ "确认密码" | translate }}</label>
-          <input type="password" id="rpwd" name="repassword" autocomplete="new-password" required placeholder="{{ "请确认密码" | translate }}">
+          <input type="password" id="rpwd" name="repassword" autocomplete="new-password" minlength="8" maxlength="128" required placeholder="{{ "请确认密码" | translate }}">
         </div>
         <button type="submit" class="btn btn-primary" style="width: 100%;">{{ "注册" | translate }}</button>
       </form>
@@ -57,7 +57,7 @@
     </div>
   </div>
 
-  <script>
+  <script nonce="{{ csp_nonce }}">
     const form = document.getElementById('register-form');
     const messageEl = document.getElementById('form-message');
 
@@ -83,8 +83,8 @@
         return;
       }
 
-      if (pwd.length < 8 || pwd.length > 20) {
-        showMessage('{{ "密码长度不符合要求, 应在8~20位。" | translate | escapejs }}');
+      if (pwd.length < 8 || pwd.length > 128) {
+        showMessage('{{ "密码长度不符合要求，应在 8~128 位。" | translate | escapejs }}');
         return;
       }
 

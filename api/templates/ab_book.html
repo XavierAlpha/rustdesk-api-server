@@ -90,7 +90,7 @@
             {% endif %}
             <div class="ab-peer-title">{{ peer.rid }}</div>
             <div class="ab-peer-meta">{{ peer.alias }} · {{ peer.note|default:"-" }}</div>
-            <div class="ab-peer-tags">{{ peer.tags|default:"-" }}</div>
+            <div class="ab-peer-tags">{{ peer.tag_names|default:"-" }}</div>
           </div>
           {% if can_edit %}
             <form class="ab-inline-form" method="post" action="/api/ab_book">
@@ -100,7 +100,7 @@
               <input type="hidden" name="rid" value="{{ peer.rid }}">
               <input class="ab-input" type="text" name="alias" value="{{ peer.alias }}" placeholder="{% trans "别名" %}">
               <input class="ab-input ab-input-wide" type="text" name="note" value="{{ peer.note }}" placeholder="{% trans "备注" %}">
-              <input class="ab-input ab-input-wide" type="text" name="tags" value="{{ peer.tags }}" placeholder="{% trans "标签（逗号分隔）" %}">
+              <input class="ab-input ab-input-wide" type="text" name="tags" value="{{ peer.tag_names }}" placeholder="{% trans "标签（逗号分隔）" %}">
               {% if not is_personal %}
                 <input class="ab-input" type="text" name="password" placeholder="{% trans "共享密码（可选）" %}">
               {% endif %}

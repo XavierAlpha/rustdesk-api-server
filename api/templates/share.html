@@ -54,7 +54,7 @@
   <div class="card-header">
     <div>
       <h2 class="card-title">{{ "已创建的分享链接" | translate }}</h2>
-      <p class="card-subtitle">{{ "历史记录" | translate }}</p>
+      <p class="card-subtitle">{{ "出于安全考虑，完整链接只在创建时显示一次" | translate }}</p>
     </div>
   </div>
   <div class="card-body">
@@ -63,7 +63,7 @@
       <article class="item-card">
         <div class="item-header">
           <div>
-            <h3 class="item-title">{{ one.shash }}</h3>
+            <h3 class="item-title">{{ one.token_prefix }}…</h3>
             <div class="item-meta">{{ one.create_time }}</div>
           </div>
           {% if is_admin %}
@@ -78,12 +78,12 @@
           </div>
           {% endif %}
           <div class="info-item">
-            <span>{{ "链接地址" | translate }}</span>
-            <strong class="share-url" data-shash="{{ one.shash }}"></strong>
+            <span>{{ "设备数量" | translate }}</span>
+            <strong>{{ one.peer_count }}</strong>
           </div>
           <div class="info-item">
-            <span>{{ "ID列表" | translate }}</span>
-            <strong>{{ one.peers }}</strong>
+            <span>{{ "过期时间" | translate }}</span>
+            <strong>{{ one.expires_at }}</strong>
           </div>
         </div>
       </article>
@@ -92,7 +92,7 @@
   </div>
 </section>
 
-<script>
+<script nonce="{{ csp_nonce }}">
   const peers = [
     {% for peer in peers %}
     { value: "{{ peer.id }}", title: "{{ peer.name|escapejs }}" }{% if not forloop.last %},{% endif %}
@@ -105,9 +105,6 @@
   const searchEl = document.getElementById('peer-search');
   const messageEl = document.getElementById('share-message');
   const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
-  document.querySelectorAll('.share-url').forEach((el) => {
-    el.textContent = baseUrl + '/' + el.dataset.shash;
-  });
 
   const renderList = () => {
     const keyword = (searchEl.value || '').toLowerCase();
@@ -185,10 +182,13 @@
         body: formData,
       });
       const data = await resp.json();
-      if (data.code === 1) {
-        messageEl.textContent = '{{ "成功！如需分享，请复制以下链接给其他人：" | translate | escapejs }}' + ' ' + baseUrl + '/' + data.shash;
+      if (resp.ok && data.code === 1 && data.token) {
+        messageEl.textContent = '{{ "链接只显示一次，请立即复制：" | translate | escapejs }}' + ' ' + baseUrl + '/' + data.token;
         messageEl.className = 'notice is-success';
         messageEl.style.display = 'block';
+        selected.clear();
+        renderList();
+        renderTags();
       } else {
         messageEl.textContent = data.msg || '{{ "请求失败，请稍后重试。" | translate | escapejs }}';
         messageEl.className = 'notice is-warning';

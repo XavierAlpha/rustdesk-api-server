@@ -46,7 +46,10 @@
                 <a class="nav-link" href="/admin" target="_blank">{% trans "管理后台" %}</a>
                 {% endif %}
                 <a class="nav-link nav-cta" href="/webui2" target="_blank">{% trans "网页控制" %}</a>
-                <a class="nav-link" href="/api/user_action?action=logout">{% trans "退出" %}</a>
+                <form method="post" action="/api/user_action?action=logout" class="nav-logout-form">
+                  {% csrf_token %}
+                  <button type="submit" class="nav-link nav-link-button">{% trans "退出" %}</button>
+                </form>
             </nav>
             <div class="topbar-actions">
                 <div class="user-chip">
