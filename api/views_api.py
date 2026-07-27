@@ -1,23 +1,33 @@
 from django.http import JsonResponse, HttpResponse, HttpResponseRedirect
 import base64
 import binascii
+import contextlib
 import hashlib
 import json
 import datetime
+import functools
+import ipaddress
 import logging
-import math
 import os
 import re
 import secrets
+import stat
+import time
 import uuid
+from urllib.parse import urlsplit
+
+import requests
 from django.contrib import auth
+from django.contrib.auth import password_validation
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
 # from django.forms.models import model_to_dict
 from api.models import (
     RustDeskToken,
     UserProfile,
     RustDeskTag,
     RustDeskPeer,
-    RustDesDevice,
+    RustDeskDevice,
     ConnLog,
     FileLog,
     StrategyProfile,
@@ -26,35 +36,61 @@ from api.models import (
     AddressBookShare,
     AddressBookRule,
     AddressBookRuleAudit,
-    AuditSession,
     AlarmLog,
     OidcPendingAuth,
+    OidcIdentity,
     LoginAttempt,
 )
 from django.contrib.auth.models import Group
 from django.db import transaction
 from django.db import IntegrityError
-from django.db.models import Q, QuerySet
+from django.db import connection
+from django.db.models import Prefetch, Q, QuerySet
 from django.utils import timezone
-from .views_front import *
 from django.utils.translation import gettext as _
 from django.conf import settings
 from authlib.integrations.requests_client import OAuth2Session
+from joserfc import jwt
+from joserfc.jwk import KeySet
+from joserfc.jwt import JWTClaimsRegistry
 from nacl.signing import SigningKey
+
+from api.request_utils import client_ip
+from api.tag_colors import normalize_tag_color
 
 logger = logging.getLogger(__name__)
 EFFECTIVE_SECONDS = 7200
 MAX_DEPLOY_KEY_LEN = 512
 MAX_PLUGIN_SIGN_MSG_BYTES = 64 * 1024
 OIDC_PENDING_MINUTES = 5
+OIDC_MAX_PENDING_PER_IP = 20
+OIDC_DOCUMENT_MAX_BYTES = 1024 * 1024
 LOGIN_LOCK_MAX_FAILURES = 10
 LOGIN_LOCK_MAX_IP_FAILURES = 100
 LOGIN_LOCK_WINDOW_MINUTES = 15
-MAX_DEVICE_INFO_BYTES = 16 * 1024
+MAX_DEVICE_UUID_TEXT_LEN = 344
 MAX_AUDIT_INFO_BYTES = 16 * 1024
 MAX_AUDIT_NOTE_BYTES = 16 * 1024
 MAX_AUDIT_FILES = 10
+MAX_AB_PEERS = 10_000
+MAX_AB_TAGS = 256
+MAX_AB_TAGS_PER_PEER = 32
+MAX_MANAGEMENT_BATCH_ITEMS = 500
+MAX_STRATEGY_OPTIONS_BYTES = 64 * 1024
+MAX_ALLOWED_INCOMINGS = 500
 RECORD_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,255}$")
+OIDC_SAFE_ID_TOKEN_ALGORITHMS = frozenset({
+    "RS256",
+    "RS384",
+    "RS512",
+    "PS256",
+    "PS384",
+    "PS512",
+    "ES256",
+    "ES384",
+    "ES512",
+    "EdDSA",
+})
 
 
 def _load_json(request):
@@ -82,64 +118,126 @@ def _get_token_user(request):
     token_str = _get_bearer_token(request)
     if not token_str:
         return None, None
-    token = RustDeskToken.objects.filter(Q(access_token=_hash_token(token_str))).first()
+    token = (
+        RustDeskToken.objects.select_related(
+            'device__owner__strategy',
+            'device__device_group__strategy',
+            'device__strategy',
+        )
+        .filter(access_token=_hash_token(token_str))
+        .first()
+    )
     if not token:
         return None, None
     if _token_expired(token):
         token.delete()
         return None, None
-    user = UserProfile.objects.filter(Q(id=token.uid)).first()
+    user = token.device.owner if token.device_id else None
+    if not user:
+        token.delete()
+        return None, None
     if user and not user.is_active:
-        return token, None
+        token.delete()
+        return None, None
     return token, user
 
 
 def _token_expired(token):
-    now = timezone.now()
-    expires_at = token.expires_at
-    if not expires_at and token.create_time:
-        expires_at = token.create_time + datetime.timedelta(seconds=EFFECTIVE_SECONDS)
-    if expires_at and expires_at < now:
-        return True
-    return False
+    return token.expires_at <= timezone.now()
 
 
-def _issue_access_token(user, rid, device_uuid):
-    '''Create or rotate the token for this (user, device); returns (token, raw_token).
+def _issue_access_token(user, device):
+    '''Create or rotate this device's token; returns (token, raw_token).
 
     The raw token is returned to the client exactly once; only its hash is stored.
     '''
+    if not device or device.owner_id != user.id:
+        raise PermissionError("Device ownership mismatch")
     expires_at = timezone.now() + datetime.timedelta(seconds=EFFECTIVE_SECONDS)
     raw_token = secrets.token_urlsafe(32)
-    # Keyed on the device, not just the user: update_or_create leans on the
-    # uniqueness constraint so two logins racing each other end with one row and
-    # one valid hash, rather than one live token nothing will ever revoke.
-    token, _created = RustDeskToken.objects.update_or_create(
-        uid=str(user.id),
-        rid=rid,
-        uuid=device_uuid,
-        defaults={
-            'username': user.username[:20],
-            'access_token': _hash_token(raw_token),
-            'expires_at': expires_at,
-        },
-    )
+    with transaction.atomic():
+        locked_device = RustDeskDevice.objects.select_for_update().get(
+            pk=device.pk,
+        )
+        if locked_device.owner_id != user.id or not locked_device.is_active:
+            raise PermissionError("Device ownership mismatch")
+        token, _created = RustDeskToken.objects.update_or_create(
+            device=locked_device,
+            defaults={
+                'access_token': _hash_token(raw_token),
+                'expires_at': expires_at,
+            },
+        )
     return token, raw_token
 
 
 def _valid_device_identity(rid, device_uuid):
     if not isinstance(rid, str) or not isinstance(device_uuid, str):
         return False
-    if not (1 <= len(rid) <= 16 and 1 <= len(device_uuid) <= 60):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", rid):
         return False
-    return all(ch.isprintable() and not ch.isspace() for ch in rid + device_uuid)
+    return _decode_canonical_base64(device_uuid, max_decoded_bytes=256) is not None
+
+
+def _validated_login_device_info(value):
+    if not isinstance(value, dict):
+        return None
+    result = {}
+    limits = {
+        'os': 100,
+        'type': 32,
+        'name': 100,
+    }
+    if set(value) - set(limits):
+        return None
+    for key, limit in limits.items():
+        field_value = value.get(key, '')
+        if (
+            not isinstance(field_value, str)
+            or len(field_value) > limit
+            or len(field_value.encode()) > limit * 4
+            or any(ord(character) < 32 for character in field_value)
+        ):
+            return None
+        result[key] = field_value
+    return result
+
+
+def _decode_canonical_base64(value, *, max_decoded_bytes):
+    if not isinstance(value, str) or not value or len(value) > MAX_DEVICE_UUID_TEXT_LEN:
+        return None
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if not decoded or len(decoded) > max_decoded_bytes:
+        return None
+    if base64.b64encode(decoded).decode("ascii") != value:
+        return None
+    return decoded
+
+
+def _deployment_identity(rid, device_uuid, public_key):
+    if not isinstance(rid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", rid):
+        return None
+    raw_uuid = _decode_canonical_base64(device_uuid, max_decoded_bytes=256)
+    raw_public_key = _decode_canonical_base64(public_key, max_decoded_bytes=32)
+    if raw_uuid is None or raw_public_key is None or len(raw_public_key) != 32:
+        return None
+    return rid, base64.b64encode(raw_uuid).decode("ascii"), hashlib.sha256(raw_public_key).hexdigest()
+
+
+def _revoke_device_tokens(device):
+    if not device:
+        return 0
+    return RustDeskToken.objects.filter(device=device).delete()[0]
 
 
 def _get_device_token_user(request, rid, device_uuid):
     token, user = _get_token_user(request)
     if not token or not user:
         return token, None
-    if token.rid != rid or token.uuid != device_uuid:
+    if token.device.rid != rid or token.device.uuid != device_uuid:
         return token, None
     return token, user
 
@@ -147,12 +245,112 @@ def _get_device_token_user(request, rid, device_uuid):
 def _get_active_token_device(token, user):
     if not token or not user:
         return None
-    device = RustDesDevice.objects.filter(Q(rid=token.rid) & Q(uuid=token.uuid)).first()
-    if not device or not device.is_active:
-        return None
-    if device.owner_id and device.owner_id != user.id and not user.is_admin:
+    device = token.device
+    if not _is_active_owned_device(device, user):
         return None
     return device
+
+
+def _is_active_owned_device(device, user):
+    return bool(
+        device
+        and user
+        and device.is_active
+        and device.public_key_hash
+        and device.owner_id == user.id
+        and device.owner
+        and device.owner.is_active
+    )
+
+
+class DeviceIdentityConflict(Exception):
+    pass
+
+
+def _device_by_identity(rid, device_uuid, *, for_update=False):
+    queryset = RustDeskDevice.objects
+    if for_update:
+        queryset = queryset.select_for_update()
+    matches = list(
+        queryset.filter(Q(rid=rid) | Q(uuid=device_uuid))
+        .select_related(
+            'owner__strategy',
+            'device_group__strategy',
+            'strategy',
+        )
+        .order_by('pk')
+    )
+    exact = next(
+        (device for device in matches if device.rid == rid and device.uuid == device_uuid),
+        None,
+    )
+    if any(device is not exact for device in matches):
+        raise DeviceIdentityConflict
+    return exact
+
+
+def _claim_session_device(
+    user,
+    rid,
+    device_uuid,
+    ip_address='',
+    device_info=None,
+):
+    """Return the one device row a login session is allowed to claim."""
+
+    device_info = device_info or {}
+    hostname = device_info.get('name') or '-'
+    operating_system = device_info.get('os') or '-'
+    for attempt in range(2):
+        try:
+            with transaction.atomic():
+                device = _device_by_identity(
+                    rid,
+                    device_uuid,
+                    for_update=True,
+                )
+                if device and (
+                    not device.is_active
+                    or (device.owner_id and device.owner_id != user.id)
+                ):
+                    raise PermissionError("Device is unavailable")
+                if not device:
+                    return RustDeskDevice.objects.create(
+                        rid=rid,
+                        cpu='-',
+                        hostname=hostname,
+                        memory='-',
+                        os=operating_system,
+                        uuid=device_uuid,
+                        username='',
+                        version='-',
+                        ip_address=ip_address,
+                        owner=user,
+                    )
+                update_fields = []
+                if device.owner_id is None:
+                    device.owner = user
+                    update_fields.append('owner')
+                if ip_address and device.ip_address != ip_address:
+                    device.ip_address = ip_address
+                    update_fields.append('ip_address')
+                if hostname != '-' and device.hostname != hostname:
+                    device.hostname = hostname
+                    update_fields.append('hostname')
+                if (
+                    operating_system != '-'
+                    and device.os != operating_system
+                ):
+                    device.os = operating_system
+                    update_fields.append('os')
+                if update_fields:
+                    update_fields.append('update_time')
+                    device.save(update_fields=update_fields)
+                return device
+        except IntegrityError:
+            if attempt:
+                raise
+    raise IntegrityError("Unable to claim device")
 
 
 def _auth_body(user, raw_token):
@@ -192,24 +390,243 @@ def _oidc_provider_name(op):
         name = name[len('oidc/'):]
     return name
 
-def get_client_ip(request):
-    """Address to attribute a request to.
 
-    X-Forwarded-For is client-supplied unless something in front of us rewrites
-    it, so it is only trusted when the deployment opts in with TRUST_PROXY_HEADERS.
-    It keys the login lockout: trusting it unconditionally lets an attacker both
-    evade the lockout with a fresh value per attempt and lock out an arbitrary
-    victim by naming their address.
-    """
-    if getattr(settings, "TRUST_PROXY_HEADERS", False):
-        forwarded = request.META.get('HTTP_X_FORWARDED_FOR', '')
-        first = forwarded.split(',')[0].strip()
-        if first:
-            return first
-        real_ip = request.META.get('HTTP_X_REAL_IP', '').strip()
-        if real_ip:
-            return real_ip
-    return request.META.get('REMOTE_ADDR')
+def _valid_https_url(value):
+    if not isinstance(value, str) or len(value) > 2048:
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment
+    )
+
+
+def _oidc_endpoint_allowed(url, allowed_hosts):
+    if not _valid_https_url(url):
+        return False
+    try:
+        hostname = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname in frozenset(allowed_hosts)
+
+
+def _fetch_oidc_json(url, allowed_hosts):
+    if not _oidc_endpoint_allowed(url, allowed_hosts):
+        raise ValueError("OIDC endpoint is outside the configured host allowlist")
+    timeout = getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10)
+    with requests.get(
+        url,
+        timeout=timeout,
+        allow_redirects=False,
+        stream=True,
+        headers={"Accept": "application/json"},
+    ) as response:
+        response.raise_for_status()
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > OIDC_DOCUMENT_MAX_BYTES:
+            raise ValueError("OIDC document is too large")
+        body = bytearray()
+        for chunk in response.iter_content(64 * 1024):
+            body.extend(chunk)
+            if len(body) > OIDC_DOCUMENT_MAX_BYTES:
+                raise ValueError("OIDC document is too large")
+    document = json.loads(body)
+    if not isinstance(document, dict):
+        raise ValueError("OIDC document must be a JSON object")
+    return document
+
+
+@functools.lru_cache(maxsize=16)
+def _oidc_metadata(issuer, allowed_hosts):
+    issuer = str(issuer or "").rstrip("/")
+    if not _oidc_endpoint_allowed(issuer, allowed_hosts):
+        raise ValueError("OIDC issuer is outside the configured host allowlist")
+    metadata = _fetch_oidc_json(
+        f"{issuer}/.well-known/openid-configuration",
+        allowed_hosts,
+    )
+    metadata_issuer = str(metadata.get("issuer") or "").rstrip("/")
+    if metadata_issuer != issuer:
+        raise ValueError("OIDC discovery issuer mismatch")
+    for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
+        if not _oidc_endpoint_allowed(metadata.get(key), allowed_hosts):
+            raise ValueError(f"OIDC discovery contains an invalid {key}")
+    userinfo_endpoint = metadata.get("userinfo_endpoint")
+    if userinfo_endpoint and not _oidc_endpoint_allowed(
+        userinfo_endpoint,
+        allowed_hosts,
+    ):
+        raise ValueError("OIDC discovery contains an invalid userinfo_endpoint")
+    return metadata
+
+
+def _oidc_client(provider, state=None):
+    return OAuth2Session(
+        provider["client_id"],
+        provider["client_secret"],
+        scope=provider.get("scope", "openid email profile"),
+        redirect_uri=provider["redirect_uri"],
+        state=state,
+        code_challenge_method="S256",
+        default_timeout=getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10),
+    )
+
+
+def _validate_oidc_id_token(token, metadata, provider, nonce):
+    encoded = token.get("id_token")
+    if not isinstance(encoded, str) or not encoded or len(encoded) > 64 * 1024:
+        raise ValueError("OIDC provider did not return an ID token")
+    jwks = _fetch_oidc_json(
+        metadata["jwks_uri"],
+        provider["allowed_hosts"],
+    )
+    key_set = KeySet.import_key_set(jwks)
+    configured_algorithms = metadata.get("id_token_signing_alg_values_supported") or ["RS256"]
+    algorithms = [
+        value
+        for value in configured_algorithms
+        if value in OIDC_SAFE_ID_TOKEN_ALGORITHMS
+    ]
+    if not algorithms:
+        raise ValueError("OIDC provider has no supported ID token algorithm")
+    decoded = jwt.decode(encoded, key_set, algorithms=algorithms)
+    claims = decoded.claims
+    issuer = str(metadata["issuer"]).rstrip("/")
+    registry = JWTClaimsRegistry(
+        leeway=60,
+        iss={"essential": True, "value": issuer},
+        sub={"essential": True},
+        aud={"essential": True, "value": provider["client_id"]},
+        exp={"essential": True},
+        iat={"essential": True},
+        nonce={"essential": True, "value": nonce},
+    )
+    registry.validate(claims)
+    audience = claims.get("aud")
+    azp = claims.get("azp")
+    if isinstance(audience, list) and len(audience) > 1 and azp != provider["client_id"]:
+        raise ValueError("OIDC ID token has an invalid authorized party")
+    if azp and azp != provider["client_id"]:
+        raise ValueError("OIDC ID token has an invalid authorized party")
+    return claims
+
+
+def _oidc_local_username(claims, issuer, subject, attempt=0):
+    raw_candidates = (
+        claims.get("preferred_username"),
+        claims.get("name"),
+        str(claims.get("email") or "").split("@", 1)[0],
+        subject,
+    )
+    max_length = UserProfile._meta.get_field("username").max_length
+    base = ""
+    for value in raw_candidates:
+        value = str(value or "").strip()
+        value = re.sub(r"[^\w.@+-]+", "-", value, flags=re.UNICODE).strip("-")
+        if value:
+            base = value[:max_length]
+            break
+    if not base:
+        base = "oidc-user"
+    if attempt == 0 and not UserProfile.objects.filter(username=base).exists():
+        return base
+    suffix = "-" + hashlib.sha256(
+        f"{issuer}\0{subject}\0{attempt}".encode()
+    ).hexdigest()[:10]
+    return f"{base[:max_length - len(suffix)]}{suffix}"
+
+
+def _resolve_oidc_user(provider_name, issuer, claims):
+    subject = str(claims.get("sub") or "").strip()
+    if not subject or len(subject) > OidcIdentity._meta.get_field("subject").max_length:
+        raise ValueError("OIDC subject is invalid")
+    last_username = str(
+        claims.get("preferred_username")
+        or claims.get("name")
+        or ""
+    ).strip()[:255]
+    email = str(claims.get("email") or "").strip()
+    if claims.get("email_verified") is not True:
+        email = ""
+    email = email[:254]
+    if email:
+        try:
+            validate_email(email)
+        except ValidationError:
+            email = ""
+
+    user = None
+    for attempt in range(16):
+        try:
+            with transaction.atomic():
+                identity = (
+                    OidcIdentity.objects.select_for_update()
+                    .select_related("user")
+                    .filter(issuer=issuer, subject=subject)
+                    .first()
+                )
+                if identity:
+                    user = identity.user
+                    identity.provider = provider_name
+                    identity.last_username = last_username
+                    identity.last_email = email
+                    identity.save(
+                        update_fields=[
+                            "provider",
+                            "last_username",
+                            "last_email",
+                            "updated_at",
+                        ]
+                    )
+                else:
+                    username = _oidc_local_username(
+                        claims,
+                        issuer,
+                        subject,
+                        attempt,
+                    )
+                    user = UserProfile.objects.create_user(
+                        username=username,
+                        password=None,
+                        email=email,
+                        is_active=True,
+                    )
+                    user.set_unusable_password()
+                    user.save(update_fields=["password"])
+                    OidcIdentity.objects.create(
+                        issuer=issuer,
+                        subject=subject,
+                        provider=provider_name,
+                        user=user,
+                        last_username=last_username,
+                        last_email=email,
+                    )
+            break
+        except IntegrityError:
+            identity = (
+                OidcIdentity.objects.select_related("user")
+                .filter(issuer=issuer, subject=subject)
+                .first()
+            )
+            if identity:
+                user = identity.user
+                break
+    if user is None:
+        raise RuntimeError("Unable to allocate a unique OIDC account")
+    if not user.is_active:
+        raise PermissionError("OIDC account is disabled")
+    return user
+
+
+def get_client_ip(request):
+    return client_ip(request)
 
 
 def _log_event(request, event, level="info", **extra):
@@ -223,7 +640,7 @@ def _log_event(request, event, level="info", **extra):
         'method': getattr(request, 'method', ''),
     }
     payload.update({k: v for k, v in extra.items() if v is not None})
-    details = json.dumps(payload, ensure_ascii=False)
+    details = json.dumps(payload, ensure_ascii=False, default=str)
     log_fn = getattr(logger, level, logger.info)
     log_fn("event=%s details=%s", event, details)
 
@@ -240,9 +657,107 @@ def _safe_record_name(name):
 
 def _record_device_dir(token):
     namespace = hashlib.sha256(
-        f"{token.uid}\0{token.rid}\0{token.uuid}".encode()
+        (
+            f"{token.device.owner_id}\0"
+            f"{token.device.rid}\0{token.device.uuid}"
+        ).encode()
     ).hexdigest()
     return os.path.join(_record_dir(), namespace)
+
+
+def _secure_directory(path):
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    directory_stat = os.lstat(path)
+    if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(
+        directory_stat.st_mode
+    ):
+        raise OSError("Recording directory is not a real directory")
+    if directory_stat.st_mode & 0o077:
+        os.chmod(path, 0o700)
+
+
+def _ensure_record_device_dir(token):
+    root = _record_dir()
+    _secure_directory(root)
+    device_dir = _record_device_dir(token)
+    _secure_directory(device_dir)
+    return device_dir
+
+
+def _fsync_directory(path):
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_fd = os.open(path, flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+@contextlib.contextmanager
+def _record_file_lock(base_dir, filename):
+    lock_dir = os.path.join(base_dir, ".locks")
+    _secure_directory(lock_dir)
+    lock_name = hashlib.sha256(filename.encode()).hexdigest() + ".lock"
+    lock_path = os.path.join(lock_dir, lock_name)
+    lock_fd = None
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    for _attempt in range(2):
+        try:
+            lock_fd = os.open(lock_path, flags, 0o600)
+            break
+        except FileExistsError:
+            try:
+                lock_stat = os.lstat(lock_path)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(lock_stat.st_mode) or time.time() - lock_stat.st_mtime <= 300:
+                raise BlockingIOError("Recording is busy") from None
+            try:
+                os.unlink(lock_path)
+            except FileNotFoundError:
+                continue
+    if lock_fd is None:
+        raise BlockingIOError("Recording is busy")
+    try:
+        os.write(lock_fd, f"{os.getpid()} {time.time_ns()}\n".encode())
+        os.fsync(lock_fd)
+        yield
+    finally:
+        os.close(lock_fd)
+        try:
+            os.unlink(lock_path)
+        except FileNotFoundError:
+            pass
+
+
+def _open_record_file(filepath, flags):
+    fd = os.open(
+        filepath,
+        flags | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    file_stat = os.fstat(fd)
+    if not stat.S_ISREG(file_stat.st_mode):
+        os.close(fd)
+        raise OSError("Recording path is not a regular file")
+    return fd
+
+
+def _write_all(fd, data):
+    written = 0
+    while written < len(data):
+        count = os.write(fd, data[written:])
+        if count <= 0:
+            raise OSError("Recording write did not make progress")
+        written += count
 
 
 def _request_content_length(request):
@@ -284,22 +799,27 @@ def _is_reserved_ab_profile_name(name):
 
 def _ensure_personal_profile(user):
     guid = _personal_guid(user)
-    profile = AddressBookProfile.objects.filter(Q(guid=guid)).first()
-    if profile:
+    with transaction.atomic():
+        profile, _created = AddressBookProfile.objects.get_or_create(
+            guid=guid,
+            defaults={
+                'name': _personal_profile_name(),
+                'owner': user,
+                'rule': 3,
+            },
+        )
         if str(profile.owner_id) != str(user.id):
-            profile.owner = user
+            raise IntegrityError('Personal address-book GUID ownership conflict')
+        updates = []
         if not profile.name:
             profile.name = _personal_profile_name()
-        profile.rule = 3
-        profile.save(update_fields=["owner", "name", "rule", "updated_at"])
-        return profile
-    profile = AddressBookProfile(
-        guid=guid,
-        name=_personal_profile_name(),
-        owner=user,
-        rule=3,
-    )
-    profile.save()
+            updates.append('name')
+        if profile.rule != 3:
+            profile.rule = 3
+            updates.append('rule')
+        if updates:
+            updates.append('updated_at')
+            profile.save(update_fields=updates)
     return profile
 
 
@@ -328,12 +848,13 @@ def _get_rule_access(profile, user):
 def _audit_ab_rule(profile, actor, action, target_type, target_name, rule, details=None):
     if not profile:
         return
-    payload = ''
-    if details is not None:
-        try:
-            payload = json.dumps(details, ensure_ascii=False)
-        except Exception:
-            payload = str(details)
+    payload = _json_value(
+        details if details is not None else {},
+        expected_type=(dict, list),
+        max_bytes=16 * 1024,
+    )
+    if payload is None:
+        payload = {}
     AddressBookRuleAudit.objects.create(
         profile=profile,
         actor=actor if actor and getattr(actor, 'id', None) else None,
@@ -346,7 +867,8 @@ def _audit_ab_rule(profile, actor, action, target_type, target_name, rule, detai
 
 def _get_profile_access(user, guid):
     if guid == _personal_guid(user):
-        return None, user, 3
+        profile = _ensure_personal_profile(user)
+        return profile, user, 3
     profile = AddressBookProfile.objects.filter(Q(guid=guid)).first()
     if not profile:
         return None, None, 0
@@ -367,10 +889,270 @@ def _can_write_rule(rule):
 def _safe_tags(tags):
     if not isinstance(tags, list):
         return []
-    return [str(x) for x in tags if str(x).strip() != '']
+    output = []
+    seen = set()
+    for value in tags:
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if not value or value in seen:
+            continue
+        output.append(value)
+        seen.add(value)
+    return output
 
 
-def _device_update_fields(postdata):
+def _bounded_text_value(value, max_bytes, allow_empty=True):
+    if not isinstance(value, str):
+        return None
+    if not allow_empty and not value:
+        return None
+    if len(value.encode()) > max_bytes or any(
+        ord(ch) < 32 and ch not in "\n\r\t"
+        for ch in value
+    ):
+        return None
+    return value
+
+
+def _model_text_value(
+    value,
+    model,
+    field_name,
+    *,
+    allow_empty=True,
+    strip=True,
+    max_bytes=None,
+):
+    if not isinstance(value, str):
+        return None
+    value = value.strip() if strip else value
+    field = model._meta.get_field(field_name)
+    max_length = getattr(field, "max_length", None)
+    if (
+        (not allow_empty and not value)
+        or (max_length is not None and len(value) > max_length)
+    ):
+        return None
+    byte_limit = max_bytes or ((max_length or 4096) * 4)
+    return _bounded_text_value(value, byte_limit, allow_empty=allow_empty)
+
+
+def _email_value(value, *, allow_empty=True):
+    value = _model_text_value(
+        value,
+        UserProfile,
+        "email",
+        allow_empty=allow_empty,
+    )
+    if value is None or (allow_empty and not value):
+        return value
+    try:
+        validate_email(value)
+    except ValidationError:
+        return None
+    return value
+
+
+def _json_value(value, *, expected_type, max_bytes):
+    if not isinstance(value, expected_type):
+        return None
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    except (TypeError, ValueError):
+        return None
+    return value if len(encoded) <= max_bytes else None
+
+
+def _strategy_options_value(value):
+    value = _json_value(
+        value,
+        expected_type=dict,
+        max_bytes=MAX_STRATEGY_OPTIONS_BYTES,
+    )
+    if value is None or len(value) > 512:
+        return None
+    output = {}
+    for key, option_value in value.items():
+        if (
+            not isinstance(key, str)
+            or not key
+            or len(key) > 128
+            or len(key.encode()) > 512
+            or any(ord(character) < 32 for character in key)
+            or not isinstance(option_value, str)
+            or len(option_value) > 4096
+            or len(option_value.encode()) > 16 * 1024
+        ):
+            return None
+        output[key] = option_value
+    return output
+
+
+def _allowed_incomings_value(value):
+    if not isinstance(value, list) or len(value) > MAX_ALLOWED_INCOMINGS:
+        return None
+    result = []
+    seen = set()
+    for item in value:
+        item = _bounded_text_value(
+            item.strip() if isinstance(item, str) else item,
+            256,
+            False,
+        )
+        if item is None or len(item) > 128:
+            return None
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def _identifier_list(value, *, numeric=False):
+    if not isinstance(value, list) or len(value) > MAX_MANAGEMENT_BATCH_ITEMS:
+        return None
+    result = []
+    seen = set()
+    for item in value:
+        item = str(item).strip()
+        if (
+            not item
+            or len(item) > 64
+            or (numeric and (not item.isascii() or not item.isdigit()))
+        ):
+            return None
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def _strict_bool(value):
+    return value if isinstance(value, bool) else None
+
+
+def _user_by_identifier(value, *, active_only=False):
+    value = str(value or "").strip()
+    if not value or len(value) > 150:
+        return None
+    query = Q(username__iexact=value)
+    if value.isascii() and value.isdigit():
+        query |= Q(pk=int(value))
+    users = UserProfile.objects.filter(query)
+    if active_only:
+        users = users.filter(is_active=True)
+    return users.order_by("pk").first()
+
+
+def _numeric_pk(value):
+    value = str(value or "").strip()
+    if not value or len(value) > 20 or not value.isascii() or not value.isdigit():
+        return None
+    return int(value)
+
+
+def _validated_tags(tags):
+    if not isinstance(tags, list) or len(tags) > MAX_AB_TAGS_PER_PEER:
+        return None
+    output = []
+    seen = set()
+    for value in tags:
+        value = _bounded_text_value(value.strip() if isinstance(value, str) else value, 256, False)
+        if value is None or value in seen:
+            if value in seen:
+                continue
+            return None
+        output.append(value)
+        seen.add(value)
+    return output
+
+
+def _validated_peer_payload(data, is_personal, require_id=True):
+    if not isinstance(data, dict):
+        return None
+    result = {}
+    field_limits = {
+        'username': (100, 400),
+        'hostname': (100, 400),
+        'alias': (100, 400),
+        'platform': (100, 400),
+        'note': (4096, 4096),
+        'device_group_name': (60, 240),
+        'loginName': (60, 240),
+    }
+    if require_id or 'id' in data:
+        rid = _bounded_text_value(data.get('id'), 1024, False)
+        if rid is None or len(rid) > 255 or any(ch.isspace() for ch in rid):
+            return None
+        result['id'] = rid
+    for key, (max_chars, max_bytes) in field_limits.items():
+        if key in data:
+            value = _bounded_text_value(data.get(key), max_bytes)
+            if value is None or len(value) > max_chars:
+                return None
+            result[key] = value
+    if 'tags' in data:
+        tags = _validated_tags(data.get('tags'))
+        if tags is None:
+            return None
+        result['tags'] = tags
+    secret_key = 'hash' if is_personal else 'password'
+    if secret_key in data:
+        value = _bounded_text_value(data.get(secret_key), 1024)
+        if value is None or len(value) > 256:
+            return None
+        result[secret_key] = value
+    if 'same_server' in data:
+        if not isinstance(data.get('same_server'), bool):
+            return None
+        result['same_server'] = data.get('same_server')
+    return result
+
+
+def _valid_ab_rule(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        rule = int(value)
+    except (TypeError, ValueError):
+        return None
+    return rule if rule in (1, 2, 3) else None
+
+
+DEVICE_INVENTORY_FIELDS = frozenset({
+    'cpu',
+    'hostname',
+    'memory',
+    'os',
+    'username',
+    'version',
+})
+DEVICE_ADDRESS_BOOK_FIELDS = frozenset({
+    'address_book_name',
+    'address_book_tag',
+    'address_book_alias',
+    'address_book_password',
+    'address_book_note',
+})
+DEVICE_SELF_SERVICE_FIELDS = (
+    DEVICE_INVENTORY_FIELDS
+    | DEVICE_ADDRESS_BOOK_FIELDS
+    | {'note'}
+)
+DEVICE_POLICY_INPUT_KEYS = frozenset({
+    'device_group_name',
+    'preset-device-group-name',
+    'strategy_name',
+    'preset-strategy-name',
+})
+
+
+def _device_update_fields(postdata, allowed_fields):
     mapping = {
         'cpu': 'cpu',
         'hostname': 'hostname',
@@ -380,12 +1162,8 @@ def _device_update_fields(postdata):
         'version': 'version',
         'device_name': 'hostname',
         'device_username': 'username',
-        'device_group_name': 'device_group_name',
         'note': 'note',
-        'preset-device-group-name': 'device_group_name',
         'preset-note': 'note',
-        'preset-strategy-name': 'strategy_name',
-        'strategy_name': 'strategy_name',
         'address_book_name': 'address_book_name',
         'address_book_tag': 'address_book_tag',
         'address_book_alias': 'address_book_alias',
@@ -399,13 +1177,20 @@ def _device_update_fields(postdata):
     }
     updates = {}
     for key, field in mapping.items():
-        if key in postdata and postdata[key] is not None:
+        if (
+            field in allowed_fields
+            and key in postdata
+            and postdata[key] is not None
+        ):
             updates[field] = postdata[key]
     return updates
 
 
-def _validated_device_update_fields(postdata):
-    updates = _device_update_fields(postdata)
+def _validated_device_update_fields(
+    postdata,
+    allowed_fields=DEVICE_INVENTORY_FIELDS,
+):
+    updates = _device_update_fields(postdata, allowed_fields)
     limits = {
         'cpu': 100,
         'hostname': 100,
@@ -413,9 +1198,7 @@ def _validated_device_update_fields(postdata):
         'os': 100,
         'username': 100,
         'version': 100,
-        'device_group_name': 60,
         'note': 4096,
-        'strategy_name': 60,
         'address_book_name': 60,
         'address_book_tag': 60,
         'address_book_alias': 60,
@@ -428,88 +1211,118 @@ def _validated_device_update_fields(postdata):
     return updates
 
 
-def _valid_deploy_text(value, min_len=1, max_len=100):
-    if not isinstance(value, str):
-        return False
-    if len(value) < min_len or len(value) > max_len:
-        return False
-    return not any(ch.isspace() or ord(ch) < 32 for ch in value)
-
-
-def _assign_owner(device, owner_name, link_user=True, allow_override=True):
-    if not owner_name:
-        return
-    if not allow_override and device.owner_name and device.owner_name != owner_name:
-        return
-    device.owner_name = owner_name
-    if link_user:
-        owner = UserProfile.objects.filter(Q(username=owner_name)).first()
-        if owner:
-            device.owner = owner
+def _contains_device_policy_assignment(postdata):
+    return any(key in postdata for key in DEVICE_POLICY_INPUT_KEYS)
 
 
 def _get_or_create_profile(user, name):
     if not name:
         return None
-    profile = AddressBookProfile.objects.filter(Q(owner=user) & Q(name=name)).first()
-    if profile:
-        return profile
-    profile = AddressBookProfile(
-        guid=uuid.uuid4().hex,
-        name=name,
-        owner=user,
-        rule=3,
-    )
-    profile.save()
-    return profile
+    try:
+        with transaction.atomic():
+            profile, _created = AddressBookProfile.objects.get_or_create(
+                owner=user,
+                name=name,
+                defaults={
+                    'guid': uuid.uuid4().hex,
+                    'rule': 3,
+                },
+            )
+            return profile
+    except IntegrityError:
+        return AddressBookProfile.objects.get(owner=user, name=name)
 
 
-def _upsert_ab_peer(owner, guid, rid, data, is_personal):
-    peer = RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(rid=rid) & Q(profile_guid=guid)).first()
-    tags = _safe_tags(data.get('tags', []))
-    tags_str = ','.join(tags)
-    if not peer:
-        device = RustDesDevice.objects.filter(Q(rid=rid)).first()
-        peer = RustDeskPeer(
-            uid=owner.id,
-            rid=rid,
-            username=(device.username if device else ''),
-            hostname=(device.hostname if device else ''),
-            platform=(device.os if device else ''),
-            alias=data.get('alias', ''),
-            tags=tags_str,
-            rhash=data.get('hash', '') if is_personal else '',
-            password=data.get('password', '') if not is_personal else '',
-            note=data.get('note', ''),
-            device_group_name=data.get('device_group_name', ''),
-            login_name=data.get('loginName', ''),
-            same_server=bool(data.get('same_server', False)),
-            profile_guid=guid,
+def _upsert_ab_peer(profile, rid, data, is_personal):
+    payload = dict(data)
+    payload['id'] = rid
+    payload = _validated_peer_payload(payload, is_personal)
+    if payload is None:
+        raise ValueError('Invalid address-book peer')
+    rid = payload.pop('id')
+    tag_names = payload.pop('tags', None)
+    with transaction.atomic():
+        profile = AddressBookProfile.objects.select_for_update().get(
+            pk=profile.pk,
         )
-    else:
-        if 'alias' in data:
-            peer.alias = data.get('alias', peer.alias)
-        if 'username' in data:
-            peer.username = data.get('username', peer.username)
-        if 'hostname' in data:
-            peer.hostname = data.get('hostname', peer.hostname)
-        if 'platform' in data:
-            peer.platform = data.get('platform', peer.platform)
-        if 'tags' in data:
-            peer.tags = tags_str
-        if 'note' in data:
-            peer.note = data.get('note', peer.note)
-        if 'device_group_name' in data:
-            peer.device_group_name = data.get('device_group_name', peer.device_group_name)
-        if 'loginName' in data:
-            peer.login_name = data.get('loginName', peer.login_name)
-        if is_personal:
-            if 'hash' in data:
-                peer.rhash = data.get('hash', peer.rhash)
-        else:
-            if 'password' in data:
-                peer.password = data.get('password', peer.password)
-    peer.save()
+        device = RustDeskDevice.objects.filter(Q(rid=rid)).first()
+        peer, _created = RustDeskPeer.objects.select_for_update().get_or_create(
+            profile=profile,
+            rid=rid,
+            defaults={
+                'username': device.username if device else '',
+                'hostname': device.hostname if device else '',
+                'platform': device.os if device else '',
+            },
+        )
+        field_map = {
+            'username': 'username',
+            'hostname': 'hostname',
+            'alias': 'alias',
+            'platform': 'platform',
+            'note': 'note',
+            'device_group_name': 'device_group_name',
+            'loginName': 'login_name',
+            'same_server': 'same_server',
+        }
+        for source, target in field_map.items():
+            if source in payload:
+                setattr(peer, target, payload[source])
+        if is_personal and 'hash' in payload:
+            peer.rhash = payload['hash']
+        if not is_personal and 'password' in payload:
+            peer.password = payload['password']
+        peer.save()
+        if tag_names is not None:
+            existing_tags = {
+                tag.tag_name: tag
+                for tag in RustDeskTag.objects.filter(
+                    profile=profile,
+                    tag_name__in=tag_names,
+                )
+            }
+            missing_names = [
+                name for name in tag_names if name not in existing_tags
+            ]
+            if (
+                RustDeskTag.objects.filter(profile=profile).count()
+                + len(missing_names)
+                > MAX_AB_TAGS
+            ):
+                raise ValueError('Address-book tag limit reached')
+            RustDeskTag.objects.bulk_create(
+                [
+                    RustDeskTag(
+                        profile=profile,
+                        tag_name=name,
+                        tag_color='',
+                    )
+                    for name in missing_names
+                ],
+                ignore_conflicts=True,
+            )
+            peer.tags.set(
+                RustDeskTag.objects.filter(
+                    profile=profile,
+                    tag_name__in=tag_names,
+                )
+            )
+    return peer
+
+
+def _ensure_personal_device_peer(user, device):
+    if not device or not device.public_key_hash:
+        return None
+    profile = _ensure_personal_profile(user)
+    peer, _created = RustDeskPeer.objects.get_or_create(
+        profile=profile,
+        rid=device.rid,
+        defaults={
+            'username': device.username or '',
+            'hostname': device.hostname or '',
+            'platform': device.os or '',
+        },
+    )
     return peer
 
 
@@ -522,7 +1335,10 @@ def _login_locked(ip, username):
 
 
 def _record_login_failure(ip, username):
-    LoginAttempt.objects.create(ip=ip or '', username=username.casefold()[:150])
+    LoginAttempt.objects.create(
+        ip=ip or '0.0.0.0',
+        username=username.casefold()[:150],
+    )
     # Opportunistic cleanup keeps the table tiny without a scheduled job.
     window_start = timezone.now() - datetime.timedelta(minutes=LOGIN_LOCK_WINDOW_MINUTES)
     LoginAttempt.objects.filter(created_at__lt=window_start).delete()
@@ -541,25 +1357,20 @@ def login(request):
     password = data.get('password', '')
     rid = data.get('id', '')
     uuid = data.get('uuid', '')
-    deviceInfo = data.get('deviceInfo', '')
+    device_info = _validated_login_device_info(
+        data.get('deviceInfo', {})
+    )
     if (
         not username
         or len(username) > UserProfile._meta.get_field('username').max_length
         or not isinstance(password, str)
         or not password
-        or len(password) > 1024
+        or len(password) > settings.MAX_PASSWORD_LENGTH
         or not _valid_device_identity(rid, uuid)
+        or device_info is None
     ):
         _log_event(request, 'api_login_invalid_payload', level="warning", username=username)
         return JsonResponse({'error': 'Invalid login payload'}, status=400)
-    if isinstance(deviceInfo, (dict, list)):
-        serialized_device_info = json.dumps(deviceInfo, ensure_ascii=False)
-    elif isinstance(deviceInfo, str):
-        serialized_device_info = deviceInfo
-    else:
-        return JsonResponse({'error': 'Invalid deviceInfo'}, status=400)
-    if len(serialized_device_info.encode()) > MAX_DEVICE_INFO_BYTES:
-        return JsonResponse({'error': 'deviceInfo is too large'}, status=413)
     client_ip = get_client_ip(request)
     if _login_locked(client_ip, username):
         _log_event(request, 'api_login_locked', level="warning", username=username)
@@ -574,37 +1385,27 @@ def login(request):
         _log_event(request, 'api_login_denied', level="warning", username=username, reason='inactive')
         return JsonResponse({'error': _('账号已被禁用')}, status=403)
 
-    device = RustDesDevice.objects.filter(Q(rid=rid) & Q(uuid=uuid)).first()
-    if device and not device.is_active:
-        _log_event(request, 'api_login_denied', level="warning", username=username, reason='device_inactive', rid=rid)
-        return JsonResponse({'error': 'Device disabled'}, status=403)
-    if device and not user.is_admin and device.owner_id and device.owner_id != user.id:
-        _log_event(request, 'api_login_denied', level="warning", username=username, reason='device_owner_mismatch', rid=rid)
+    try:
+        device = _claim_session_device(
+            user,
+            rid,
+            uuid,
+            client_ip,
+            device_info,
+        )
+        _token, raw_token = _issue_access_token(user, device)
+    except DeviceIdentityConflict:
+        _log_event(request, 'api_login_denied', level="warning", username=username, reason='device_identity_conflict', rid=rid)
+        return JsonResponse({'error': 'Device identity conflict'}, status=409)
+    except PermissionError:
+        _log_event(request, 'api_login_denied', level="warning", username=username, reason='device_unavailable', rid=rid)
         return JsonResponse({'error': 'Permission denied'}, status=403)
-    if device:
-        if device.owner_id is None or device.owner_id == user.id:
-            device.owner = user
-            device.owner_name = user.username
-            device.save(update_fields=['owner', 'owner_name', 'update_time'])
-
-    token, raw_token = _issue_access_token(user, rid, uuid)
+    except IntegrityError:
+        _log_event(request, 'api_login_denied', level="warning", username=username, reason='device_identity_race', rid=rid)
+        return JsonResponse({'error': 'Device identity conflict'}, status=409)
     LoginAttempt.objects.filter(Q(ip=client_ip) & Q(username=username.casefold())).delete()
 
-    if rid:
-        personal_guid = _personal_guid(user)
-        peer = RustDeskPeer.objects.filter(Q(uid=user.id) & Q(rid=rid) & Q(profile_guid=personal_guid)).first()
-        if not peer and device:
-            RustDeskPeer.objects.create(
-                uid=user.id,
-                rid=device.rid,
-                username=device.username or '',
-                hostname=device.hostname or '',
-                alias='',
-                platform=device.os or '',
-                tags='',
-                rhash='',
-                profile_guid=personal_guid,
-            )
+    _ensure_personal_device_peer(user, device)
 
     result.update(_auth_body(user, raw_token))
     _log_event(request, 'api_login_success', username=user.username, rid=rid)
@@ -623,19 +1424,15 @@ def logout(request):
     token.delete()
 
     result = {'code': 1}
-    _log_event(request, 'api_logout_success', username=user.username, rid=token.rid)
+    _log_event(request, 'api_logout_success', username=user.username, rid=token.device.rid)
     return JsonResponse(result)
 
 
 def currentUser(request):
     result = {}
-    if request.method == 'GET':
-        result['error'] = _('错误的提交方式！')
+    if request.method != 'POST':
         _log_event(request, 'api_current_user_invalid_method', level="warning")
-        return JsonResponse(result)
-    # postdata = json.loads(request.body)
-    # rid = postdata.get('id', '')
-    # uuid = postdata.get('uuid', '')
+        return JsonResponse({'error': _('错误的提交方式！')}, status=405)
 
     token, user = _get_token_user(request)
 
@@ -655,86 +1452,6 @@ def currentUser(request):
     return JsonResponse(result)
 
 
-def ab(request):
-    token, user = _get_token_user(request)
-    if not user:
-        _log_event(request, 'api_ab_unauthorized', level="warning")
-        return JsonResponse({'error': _('拉取列表错误！')}, status=401)
-    guid = _personal_guid(user)
-
-    if request.method == 'GET':
-        result = {}
-        tags = RustDeskTag.objects.filter(Q(uid=user.id) & Q(profile_guid=guid))
-        tag_names = [str(x.tag_name) for x in tags]
-        tag_colors = {str(x.tag_name): int(x.tag_color) for x in tags if x.tag_color != ''}
-
-        peers = RustDeskPeer.objects.filter(Q(uid=user.id) & Q(profile_guid=guid))
-        peers_result = []
-        for peer in peers:
-            tmp = {
-                'id': peer.rid,
-                'username': peer.username,
-                'hostname': peer.hostname,
-                'alias': peer.alias,
-                'platform': peer.platform,
-                'tags': [x for x in peer.tags.split(',') if x],
-                'hash': peer.rhash,
-            }
-            peers_result.append(tmp)
-
-        result['updated_at'] = timezone.now()
-        result['data'] = json.dumps({
-            'tags': tag_names,
-            'peers': peers_result,
-            'tag_colors': json.dumps(tag_colors)
-        })
-        _log_event(request, 'api_ab_fetch', level="debug", username=user.username, guid=guid, tags=len(tag_names), peers=len(peers_result))
-        return JsonResponse(result)
-    else:
-        postdata = _load_json(request)
-        data = postdata.get('data', '')
-        try:
-            data = {} if data == '' else json.loads(data)
-        except Exception:
-            _log_event(request, 'api_ab_update_failed', level="warning", username=user.username, guid=guid, reason='invalid_json')
-            return JsonResponse({'error': 'Invalid data'}, status=400)
-        tagnames = data.get('tags', [])
-        tag_colors = data.get('tag_colors', '')
-        tag_colors = {} if tag_colors == '' else json.loads(tag_colors)
-        peers = data.get('peers', [])
-
-        with transaction.atomic():
-            RustDeskTag.objects.filter(Q(uid=user.id) & Q(profile_guid=guid)).delete()
-            RustDeskPeer.objects.filter(Q(uid=user.id) & Q(profile_guid=guid)).delete()
-            if tagnames:
-                RustDeskTag.objects.bulk_create([
-                    RustDeskTag(
-                        uid=user.id,
-                        tag_name=name,
-                        tag_color=tag_colors.get(name, ''),
-                        profile_guid=guid,
-                    )
-                    for name in tagnames
-                ])
-            if peers:
-                newlist = []
-                for one in peers:
-                    newlist.append(RustDeskPeer(
-                        uid=user.id,
-                        rid=one['id'],
-                        username=one.get('username', ''),
-                        hostname=one.get('hostname', ''),
-                        alias=one.get('alias', ''),
-                        platform=one.get('platform', ''),
-                        tags=','.join(_safe_tags(one.get('tags', []))),
-                        rhash=one.get('hash', ''),
-                        profile_guid=guid,
-                    ))
-                RustDeskPeer.objects.bulk_create(newlist)
-        _log_event(request, 'api_ab_update', username=user.username, guid=guid, tags=len(tagnames), peers=len(peers))
-    return HttpResponse('')
-
-
 def sysinfo(request):
     if request.method != 'POST':
         _log_event(request, 'api_sysinfo_invalid_method', level="warning")
@@ -750,36 +1467,31 @@ def sysinfo(request):
     if not token or not user:
         _log_event(request, 'api_sysinfo_unauthorized', level="warning", rid=rid)
         return JsonResponse({'error': 'Invalid device token'}, status=401)
+    if _contains_device_policy_assignment(postdata):
+        _log_event(
+            request,
+            'api_sysinfo_policy_fields_ignored',
+            level='warning',
+            username=user.username,
+            rid=rid,
+        )
     updates = _validated_device_update_fields(postdata)
     if updates is None:
         _log_event(request, 'api_sysinfo_invalid_payload', level="warning", username=user.username, rid=rid)
         return JsonResponse({'error': 'Invalid device information'}, status=400)
-    with transaction.atomic():
-        device = RustDesDevice.objects.select_for_update().filter(Q(rid=rid) & Q(uuid=device_uuid)).first()
-        if device and device.owner_id and device.owner_id != user.id and not user.is_admin:
-            _log_event(request, 'api_sysinfo_denied', level="warning", username=user.username, rid=rid)
-            return JsonResponse({'error': 'Permission denied'}, status=403)
-        if not device:
-            device = RustDesDevice(
-                rid=rid,
-                cpu=updates.get('cpu', '-'),
-                hostname=updates.get('hostname', '-'),
-                memory=updates.get('memory', '-'),
-                os=updates.get('os', '-'),
-                username=updates.get('username', '-'),
-                uuid=device_uuid,
-                version=updates.get('version', '-'),
-                ip_address=client_ip,
-                owner=user,
-                owner_name=user.username,
-            )
-        for key, val in updates.items():
-            setattr(device, key, val)
-        device.ip_address = client_ip
-        if device.owner_id is None:
-            device.owner = user
-            device.owner_name = user.username
-        device.save()
+    try:
+        with transaction.atomic():
+            device = _device_by_identity(rid, device_uuid, for_update=True)
+            if not _is_active_owned_device(device, user):
+                _log_event(request, 'api_sysinfo_denied', level="warning", username=user.username, rid=rid)
+                return JsonResponse({'error': 'Device is not active for this account'}, status=403)
+            for key, val in updates.items():
+                setattr(device, key, val)
+            device.ip_address = client_ip
+            device.save()
+    except (DeviceIdentityConflict, IntegrityError):
+        _log_event(request, 'api_sysinfo_conflict', level="warning", username=user.username, rid=rid)
+        return JsonResponse({'error': 'Device identity conflict'}, status=409)
     _log_event(request, 'api_sysinfo_updated', level="debug", username=user.username, rid=rid, uuid=device_uuid)
     return HttpResponse('SYSINFO_UPDATED')
 
@@ -797,35 +1509,50 @@ def heartbeat(request):
     if not token or not user:
         _log_event(request, 'api_heartbeat_unauthorized', level="warning", rid=rid)
         return JsonResponse({'error': 'Invalid device token'}, status=401)
-    device = RustDesDevice.objects.filter(Q(rid=rid) & Q(uuid=device_uuid)).first()
-    if not device:
-        return JsonResponse({'error': 'ID_NOT_FOUND'}, status=404)
-    if not device.is_active:
-        _log_event(request, 'api_heartbeat_device_disabled', level="warning", username=user.username, rid=rid, uuid=device_uuid)
-        return JsonResponse({'error': 'Device disabled'}, status=403)
-    if device.owner_id and device.owner_id != user.id and not user.is_admin:
-        return JsonResponse({'error': 'Permission denied'}, status=403)
-    device.ip_address = get_client_ip(request)
-    device.save(update_fields=['ip_address', 'update_time'])
+    with transaction.atomic():
+        try:
+            device = _device_by_identity(rid, device_uuid, for_update=True)
+        except DeviceIdentityConflict:
+            return JsonResponse({'error': 'Device identity conflict'}, status=409)
+        if not _is_active_owned_device(device, user):
+            _log_event(
+                request,
+                'api_heartbeat_device_denied',
+                level="warning",
+                username=user.username,
+                rid=rid,
+                uuid=device_uuid,
+            )
+            return JsonResponse(
+                {'error': 'Device is not active for this account'},
+                status=403,
+            )
+        device.ip_address = get_client_ip(request)
+        device.save(update_fields=['ip_address', 'update_time'])
 
-    # token保活
-    expires_at = timezone.now() + datetime.timedelta(seconds=EFFECTIVE_SECONDS)
-    token.expires_at = expires_at
-    token.save(update_fields=['expires_at'])
+        # Sliding expiry is extended only after the device authorization is
+        # revalidated while holding the same transaction lock.
+        token.expires_at = timezone.now() + datetime.timedelta(seconds=EFFECTIVE_SECONDS)
+        token.save(update_fields=['expires_at'])
     response = {}
     try:
         client_modified = int(postdata.get('modified_at', 0))
     except Exception:
         client_modified = 0
-    if device and device.strategy_name:
-        profile = StrategyProfile.objects.filter(Q(name=device.strategy_name)).first()
+    if device:
+        profile = device.effective_strategy()
         if profile and profile.enabled:
             server_modified = int(profile.updated_at.timestamp())
             if server_modified != client_modified:
                 response['modified_at'] = server_modified
-                try:
-                    options = json.loads(profile.config_options) if profile.config_options else {}
-                except Exception:
+                options = _strategy_options_value(
+                    profile.config_options
+                )
+                if options is None:
+                    logger.error(
+                        "event=invalid_strategy_options strategy_id=%s",
+                        profile.pk,
+                    )
                     options = {}
                 response['strategy'] = {'config_options': options, 'extra': {}}
     _log_event(request, 'api_heartbeat', level="debug", username=user.username, rid=rid, uuid=device_uuid)
@@ -842,7 +1569,31 @@ def sysinfo_ver(request):
     return HttpResponse('1')
 
 
+def health_live(request):
+    if request.method != 'GET':
+        return JsonResponse({'status': 'method_not_allowed'}, status=405)
+    return JsonResponse({'status': 'live'})
+
+
+def health_ready(request):
+    if request.method != 'GET':
+        return JsonResponse({'status': 'method_not_allowed'}, status=405)
+    if len(getattr(settings, 'DEVICE_VERIFICATION_TOKEN', '')) < 32:
+        return JsonResponse({'status': 'not_ready'}, status=503)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT 1')
+            cursor.fetchone()
+        RustDeskDevice.objects.order_by('pk').values_list('pk', flat=True).first()
+    except Exception as exc:  # noqa: BLE001 - readiness normalizes backend failures
+        logger.warning("readiness database check failed: %s", type(exc).__name__)
+        return JsonResponse({'status': 'not_ready'}, status=503)
+    return JsonResponse({'status': 'ready'})
+
+
 def login_options(request):
+    if request.method != 'GET':
+        return JsonResponse({'error': 'GET required'}, status=405)
     _log_event(request, 'api_login_options', level="debug")
     providers = getattr(settings, "OIDC_PROVIDERS", {})
     return JsonResponse([f"oidc/{name}" for name in providers.keys()], safe=False)
@@ -857,132 +1608,226 @@ def oidc_auth(request):
     if not provider:
         _log_event(request, 'api_oidc_auth_unknown_provider', level="warning", op=provider_name)
         return JsonResponse({'error': 'OIDC provider is not configured'}, status=404)
-    state = secrets.token_urlsafe(24)
-    try:
-        client = OAuth2Session(
-            provider["client_id"],
-            provider["client_secret"],
-            scope=provider.get("scope", "openid email profile"),
-            redirect_uri=provider["redirect_uri"],
-        )
-        metadata = client.load_server_metadata(f'{provider["issuer"].rstrip("/")}/.well-known/openid-configuration')
-        auth_url = client.create_authorization_url(metadata["authorization_endpoint"], state=state)[0]
-    except Exception as exc:
-        _log_event(request, 'api_oidc_auth_failed', level="warning", op=provider_name, error=str(exc))
-        return JsonResponse({'error': 'Failed to initialize OIDC authorization'}, status=502)
-    now = timezone.now()
-    OidcPendingAuth.objects.filter(
-        created_at__lt=now - datetime.timedelta(minutes=OIDC_PENDING_MINUTES)
-    ).delete()
-    device_info = data.get("deviceInfo", "")
-    OidcPendingAuth.objects.create(
-        state=state,
-        provider=provider_name,
-        rid=str(data.get("id", ""))[:16],
-        device_uuid=str(data.get("uuid", ""))[:60],
-        device_info=json.dumps(device_info, ensure_ascii=False)
-        if isinstance(device_info, (dict, list))
-        else str(device_info),
-        status=OidcPendingAuth.STATUS_PENDING,
+    rid = data.get("id", "")
+    device_uuid = data.get("uuid", "")
+    if not _valid_device_identity(rid, device_uuid):
+        return JsonResponse({'error': 'Invalid device identity'}, status=400)
+    device_info = _validated_login_device_info(
+        data.get("deviceInfo", {})
     )
+    if device_info is None:
+        return JsonResponse({'error': 'Invalid deviceInfo'}, status=400)
+
+    now = timezone.now()
+    cutoff = now - datetime.timedelta(minutes=OIDC_PENDING_MINUTES)
+    OidcPendingAuth.objects.filter(created_at__lt=cutoff).delete()
+    client_ip = get_client_ip(request)
+    if OidcPendingAuth.objects.filter(
+        request_ip=client_ip,
+        created_at__gte=cutoff,
+    ).count() >= OIDC_MAX_PENDING_PER_IP:
+        _log_event(request, 'api_oidc_auth_rate_limited', level="warning", op=provider_name)
+        return JsonResponse({'error': 'Too many pending OIDC authorizations'}, status=429)
+
+    state = secrets.token_urlsafe(32)
+    poll_code = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    code_verifier = secrets.token_urlsafe(64)
+    try:
+        if not _valid_https_url(provider.get("redirect_uri")):
+            raise ValueError("OIDC redirect URI must use HTTPS")
+        metadata = _oidc_metadata(
+            provider["issuer"],
+            provider["allowed_hosts"],
+        )
+        client = _oidc_client(provider)
+        auth_url = client.create_authorization_url(
+            metadata["authorization_endpoint"],
+            state=state,
+            code_verifier=code_verifier,
+            nonce=nonce,
+        )[0]
+        OidcPendingAuth.objects.create(
+            state=state,
+            poll_code_hash=_hash_token(poll_code),
+            provider=provider_name,
+            request_ip=client_ip,
+            rid=rid,
+            device_uuid=device_uuid,
+            device_info=device_info,
+            nonce=nonce,
+            code_verifier=code_verifier,
+            status=OidcPendingAuth.STATUS_PENDING,
+        )
+    except Exception as exc:  # noqa: BLE001 - external provider failures are normalized
+        _log_event(
+            request,
+            'api_oidc_auth_failed',
+            level="warning",
+            op=provider_name,
+            error_type=type(exc).__name__,
+        )
+        return JsonResponse({'error': 'Failed to initialize OIDC authorization'}, status=502)
     _log_event(request, 'api_oidc_auth_created', level="debug", op=provider_name)
-    return JsonResponse({'code': state, 'url': auth_url})
+    return JsonResponse({'code': poll_code, 'url': auth_url})
 
 
 def oidc_auth_query(request):
-    state = str(request.GET.get('code', '')).strip()
-    session = OidcPendingAuth.objects.filter(Q(state=state)).first() if state else None
-    if not session:
+    if request.method != 'GET':
+        return JsonResponse({'error': 'GET required'}, status=405)
+    poll_code = str(request.GET.get('code', '')).strip()
+    if not poll_code or len(poll_code) > 128:
         return JsonResponse({'error': 'No authed oidc is found'})
-    if timezone.now() - session.created_at > datetime.timedelta(minutes=3):
+    with transaction.atomic():
+        session = (
+            OidcPendingAuth.objects.select_for_update()
+            .select_related('authenticated_user')
+            .filter(poll_code_hash=_hash_token(poll_code))
+            .first()
+        )
+        if not session:
+            return JsonResponse({'error': 'No authed oidc is found'})
+        if timezone.now() - session.created_at > datetime.timedelta(minutes=OIDC_PENDING_MINUTES):
+            session.delete()
+            return JsonResponse({'error': 'OIDC authorization timeout'}, status=408)
+        if session.status == OidcPendingAuth.STATUS_ERROR:
+            session.delete()
+            return JsonResponse({'error': 'OIDC authorization failed'}, status=400)
+        if session.status != OidcPendingAuth.STATUS_DONE or not session.authenticated_user:
+            return JsonResponse({'error': 'No authed oidc is found'})
+        user = session.authenticated_user
+        if not user.is_active:
+            session.delete()
+            return JsonResponse({'error': 'OIDC authorization failed'}, status=403)
+        try:
+            device = _claim_session_device(
+                user,
+                session.rid,
+                session.device_uuid,
+                session.request_ip,
+                session.device_info,
+            )
+            _token, raw_token = _issue_access_token(user, device)
+        except (DeviceIdentityConflict, IntegrityError):
+            session.delete()
+            return JsonResponse({'error': 'OIDC authorization failed'}, status=409)
+        except PermissionError:
+            session.delete()
+            return JsonResponse({'error': 'OIDC authorization failed'}, status=403)
+        body = _auth_body(user, raw_token)
         session.delete()
-        return JsonResponse({'error': 'OIDC authorization timeout'}, status=408)
-    if session.status == OidcPendingAuth.STATUS_ERROR:
-        error = session.error or 'OIDC authorization failed'
-        session.delete()
-        return JsonResponse({'error': error}, status=400)
-    if session.status != OidcPendingAuth.STATUS_DONE:
-        return JsonResponse({'error': 'No authed oidc is found'})
-    body = session.body or {}
-    session.delete()
     return JsonResponse(body)
 
 
 def oidc_callback(request):
+    if request.method != 'GET':
+        return HttpResponse('GET required', status=405)
     state = str(request.GET.get('state', '')).strip()
     code = str(request.GET.get('code', '')).strip()
     session = OidcPendingAuth.objects.filter(Q(state=state)).first() if state else None
+    provider_error = str(request.GET.get('error', '')).strip()
+    if provider_error and session:
+        OidcPendingAuth.objects.filter(
+            state=state,
+            status=OidcPendingAuth.STATUS_PENDING,
+        ).update(
+            status=OidcPendingAuth.STATUS_ERROR,
+            error_code='provider_denied',
+        )
+        return HttpResponse('OIDC authorization was not completed.', status=400)
     if not state or not code or not session:
         return HttpResponse('Invalid OIDC callback', status=400)
+    if timezone.now() - session.created_at > datetime.timedelta(minutes=OIDC_PENDING_MINUTES):
+        session.delete()
+        return HttpResponse('OIDC authorization expired', status=408)
+    if session.status == OidcPendingAuth.STATUS_DONE:
+        return HttpResponse('OIDC authorization completed. You can close this window.')
+    if session.status != OidcPendingAuth.STATUS_PENDING:
+        return HttpResponse('OIDC authorization was not completed.', status=400)
     provider = getattr(settings, "OIDC_PROVIDERS", {}).get(session.provider)
     if not provider:
         session.status = OidcPendingAuth.STATUS_ERROR
-        session.error = "OIDC provider is not configured"
-        session.save(update_fields=['status', 'error'])
+        session.error_code = "provider_not_configured"
+        session.save(update_fields=['status', 'error_code'])
         return HttpResponse('OIDC provider is not configured', status=400)
     try:
-        client = OAuth2Session(
-            provider["client_id"],
-            provider["client_secret"],
-            scope=provider.get("scope", "openid email profile"),
-            redirect_uri=provider["redirect_uri"],
+        metadata = _oidc_metadata(
+            provider["issuer"],
+            provider["allowed_hosts"],
         )
-        metadata = client.load_server_metadata(f'{provider["issuer"].rstrip("/")}/.well-known/openid-configuration')
-        client.fetch_token(metadata["token_endpoint"], code=code)
-        userinfo = client.get(metadata["userinfo_endpoint"]).json()
-        username = (
-            userinfo.get("preferred_username")
-            or userinfo.get("email")
-            or userinfo.get("sub")
-            or ""
-        ).strip()
-        if not username:
-            raise ValueError("OIDC user has no stable username")
-        email = str(userinfo.get("email", "")).strip()
-        user, created = UserProfile.objects.get_or_create(username=username, defaults={"email": email})
-        if email and user.email != email:
-            user.email = email
-        if created:
-            user.set_unusable_password()
-        user.rid = session.rid
-        user.uuid = session.device_uuid
-        user.deviceInfo = session.device_info
-        user.save()
-        if not user.is_active:
-            raise PermissionError("Account is disabled")
-        token, raw_token = _issue_access_token(user, session.rid, session.device_uuid)
-        session.body = _auth_body(user, raw_token)
-        session.status = OidcPendingAuth.STATUS_DONE
-        session.save(update_fields=['body', 'status'])
+        client = _oidc_client(provider, state=state)
+        token = client.fetch_token(
+            metadata["token_endpoint"],
+            code=code,
+            code_verifier=session.code_verifier,
+            allow_redirects=False,
+        )
+        claims = _validate_oidc_id_token(token, metadata, provider, session.nonce)
+        issuer = str(claims["iss"]).rstrip("/")
+        user = _resolve_oidc_user(session.provider, issuer, claims)
+        with transaction.atomic():
+            pending = OidcPendingAuth.objects.select_for_update().filter(state=state).first()
+            if not pending or pending.status != OidcPendingAuth.STATUS_PENDING:
+                return HttpResponse('OIDC authorization was already consumed.', status=409)
+            pending.authenticated_user = user
+            pending.status = OidcPendingAuth.STATUS_DONE
+            pending.error_code = ''
+            pending.save(
+                update_fields=['authenticated_user', 'status', 'error_code']
+            )
         _log_event(request, 'api_oidc_callback_success', username=user.username)
-    except Exception as exc:
-        session.status = OidcPendingAuth.STATUS_ERROR
-        session.error = str(exc)
-        session.save(update_fields=['status', 'error'])
-        _log_event(request, 'api_oidc_callback_failed', level="warning", error=str(exc))
+    except Exception as exc:  # noqa: BLE001 - external provider failures are normalized
+        OidcPendingAuth.objects.filter(
+            state=state,
+            status=OidcPendingAuth.STATUS_PENDING,
+        ).update(
+            status=OidcPendingAuth.STATUS_ERROR,
+            error_code='verification_failed',
+        )
+        _log_event(
+            request,
+            'api_oidc_callback_failed',
+            level="warning",
+            error_type=type(exc).__name__,
+        )
         return HttpResponse('OIDC authorization failed', status=400)
     return HttpResponse('OIDC authorization completed. You can close this window.')
 
 
 def devices_cli(request):
-    if request.method == 'GET':
+    if request.method != 'POST':
         _log_event(request, 'api_devices_cli_invalid_method', level="warning")
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')})
-    token, user = _get_token_user(request)
-    if not user:
-        _log_event(request, 'api_devices_cli_unauthorized', level="warning")
-        return JsonResponse({'error': 'Invalid token'}, status=401)
+        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')}, status=405)
     postdata = _load_json(request)
     rid = postdata.get('id', '')
-    uuid = postdata.get('uuid', '')
-    if not rid or not uuid:
+    device_uuid = postdata.get('uuid', '')
+    if not _valid_device_identity(rid, device_uuid):
         _log_event(request, 'api_devices_cli_missing_id', level="warning")
         return JsonResponse({'error': 'ID_NOT_FOUND'}, status=400)
+    token, user = _get_device_token_user(request, rid, device_uuid)
+    if not token or not user:
+        _log_event(request, 'api_devices_cli_unauthorized', level="warning")
+        return JsonResponse({'error': 'Invalid device token'}, status=401)
     owner_name = postdata.get('user_name', '')
-    if owner_name and not user.is_admin and owner_name != user.username:
+    if not isinstance(owner_name, str) or len(owner_name) > 150:
+        return JsonResponse({'error': 'Invalid user_name'}, status=400)
+    if owner_name and owner_name != user.username:
         _log_event(request, 'api_devices_cli_denied', level="warning", username=user.username, rid=rid, reason='owner_mismatch')
-        return JsonResponse({'error': 'Admin required'}, status=403)
-    updates = _device_update_fields(postdata)
+        return JsonResponse({'error': 'Device ownership cannot be changed here'}, status=403)
+    if _contains_device_policy_assignment(postdata):
+        _log_event(
+            request,
+            'api_devices_cli_policy_fields_ignored',
+            level='warning',
+            username=user.username,
+            rid=rid,
+        )
+    updates = _validated_device_update_fields(
+        postdata,
+        DEVICE_SELF_SERVICE_FIELDS,
+    )
+    if updates is None:
+        return JsonResponse({'error': 'Invalid device information'}, status=400)
     ab_name = postdata.get('address_book_name', '')
     ab_tag = postdata.get('address_book_tag', '')
     ab_alias = postdata.get('address_book_alias', '')
@@ -990,35 +1835,22 @@ def devices_cli(request):
     ab_note = postdata.get('address_book_note', '')
     requires_ab = any([ab_name, ab_tag, ab_alias, ab_password, ab_note])
 
-    device = RustDesDevice.objects.filter(Q(rid=rid) & Q(uuid=uuid)).first()
-    if device and not user.is_admin and device.owner_id and device.owner_id != user.id:
-        _log_event(request, 'api_devices_cli_denied', level="warning", username=user.username, rid=rid, reason='device_owner_mismatch')
-        return JsonResponse({'error': 'Permission denied'}, status=403)
-
     try:
         with transaction.atomic():
-            if not device:
-                device = RustDesDevice(
-                    rid=rid,
-                    cpu=updates.get('cpu', '-'),
-                    hostname=updates.get('hostname', postdata.get('device_name', '-')),
-                    memory=updates.get('memory', '-'),
-                    os=updates.get('os', '-'),
-                    username=updates.get('username', postdata.get('device_username', '-')),
-                    uuid=uuid,
-                    version=updates.get('version', '-'),
-                    ip_address=get_client_ip(request)
-                )
+            device = _device_by_identity(rid, device_uuid, for_update=True)
+            if not _is_active_owned_device(device, user):
+                _log_event(request, 'api_devices_cli_denied', level="warning", username=user.username, rid=rid, reason='device_owner_mismatch')
+                return JsonResponse({'error': 'Device is not active for this account'}, status=403)
             for key, val in updates.items():
                 setattr(device, key, val)
-            _assign_owner(device, owner_name)
             device.save()
 
             if requires_ab:
                 if not device.owner:
                     raise ValueError('Invalid user_name')
                 profile = _get_or_create_profile(device.owner, ab_name) if ab_name else None
-                guid = profile.guid if profile else _personal_guid(device.owner)
+                profile = profile or _ensure_personal_profile(device.owner)
+                guid = profile.guid
                 is_personal = guid == _personal_guid(device.owner)
                 tags = [ab_tag] if ab_tag else []
                 peer_data = {
@@ -1031,17 +1863,19 @@ def devices_cli(request):
                         peer_data['hash'] = ab_password
                     else:
                         peer_data['password'] = ab_password
-                _upsert_ab_peer(device.owner, guid, rid, peer_data, is_personal)
+                _upsert_ab_peer(profile, rid, peer_data, is_personal)
                 if ab_tag:
                     RustDeskTag.objects.get_or_create(
-                        uid=device.owner.id,
+                        profile=profile,
                         tag_name=ab_tag,
-                        profile_guid=guid,
                         defaults={'tag_color': ''},
                     )
     except ValueError:
         _log_event(request, 'api_devices_cli_failed', level="warning", username=user.username, rid=rid, reason='invalid_user_name')
         return JsonResponse({'error': 'Invalid user_name'}, status=400)
+    except (DeviceIdentityConflict, IntegrityError):
+        _log_event(request, 'api_devices_cli_conflict', level="warning", username=user.username, rid=rid)
+        return JsonResponse({'error': 'Device identity conflict'}, status=409)
     _log_event(request, 'api_devices_cli_updated', username=user.username, rid=rid)
     return HttpResponse('')
 
@@ -1054,49 +1888,116 @@ def devices_deploy(request):
     if not user:
         _log_event(request, 'api_devices_deploy_unauthorized', level="warning")
         return JsonResponse({'error': 'Invalid token'}, status=401)
+    if len(settings.DEVICE_VERIFICATION_TOKEN) < 32:
+        _log_event(request, 'api_devices_deploy_not_enabled', level="error", username=user.username)
+        return JsonResponse({'result': 'NOT_ENABLED'}, status=503)
     postdata = _load_json(request)
     rid = str(postdata.get('id', '')).strip()
     uuid_value = str(postdata.get('uuid', '')).strip()
     pk = str(postdata.get('pk', '')).strip()
-    if (
-        not _valid_deploy_text(rid, min_len=6, max_len=60)
-        or not _valid_deploy_text(uuid_value, max_len=100)
-        or not _valid_deploy_text(pk, max_len=MAX_DEPLOY_KEY_LEN)
-    ):
+    identity = _deployment_identity(rid, uuid_value, pk)
+    if identity is None or len(pk) > MAX_DEPLOY_KEY_LEN:
         _log_event(request, 'api_devices_deploy_invalid_input', level="warning", username=user.username, rid=rid)
         return JsonResponse({'result': 'INVALID_INPUT'}, status=400)
+    rid, uuid_value, public_key_hash = identity
+    if token.device.uuid != uuid_value:
+        _log_event(
+            request,
+            'api_devices_deploy_denied',
+            level="warning",
+            username=user.username,
+            rid=rid,
+            reason='token_device_mismatch',
+        )
+        return JsonResponse({'error': 'Device token mismatch'}, status=403)
 
-    conflict = RustDesDevice.objects.filter(Q(rid=rid)).exclude(Q(uuid=uuid_value)).first()
-    if conflict:
-        _log_event(request, 'api_devices_deploy_id_taken', level="warning", username=user.username, rid=rid)
-        return JsonResponse({'result': 'ID_TAKEN'})
-
-    with transaction.atomic():
-        device = RustDesDevice.objects.select_for_update().filter(Q(uuid=uuid_value)).first()
-        if device and device.owner_id and device.owner_id != user.id and not user.is_admin:
-            _log_event(request, 'api_devices_deploy_denied', level="warning", username=user.username, rid=rid)
-            return JsonResponse({'error': 'Permission denied'}, status=403)
-        if not device:
-            device = RustDesDevice(
-                rid=rid,
-                cpu='-',
-                hostname='-',
-                memory='-',
-                os='-',
-                uuid=uuid_value,
-                username='',
-                version='-',
-                ip_address=get_client_ip(request),
+    try:
+        with transaction.atomic():
+            matches = list(
+                RustDeskDevice.objects.select_for_update()
+                .filter(Q(rid=rid) | Q(uuid=uuid_value))
+                .order_by('pk')
             )
-        device.rid = rid
-        device.uuid = uuid_value
-        device.owner = user
-        device.owner_name = user.username
-        device.ip_address = get_client_ip(request)
-        device.save()
+            id_match = next((item for item in matches if item.rid == rid), None)
+            uuid_match = next((item for item in matches if item.uuid == uuid_value), None)
+            if id_match and id_match.uuid != uuid_value:
+                _log_event(request, 'api_devices_deploy_id_taken', level="warning", username=user.username, rid=rid)
+                return JsonResponse({'result': 'ID_TAKEN'}, status=409)
+            if id_match and uuid_match and id_match.pk != uuid_match.pk:
+                _log_event(request, 'api_devices_deploy_conflict', level="error", username=user.username, rid=rid)
+                return JsonResponse({'result': 'ID_TAKEN'}, status=409)
+            device = uuid_match or id_match
+            if device and device.owner_id and device.owner_id != user.id:
+                _log_event(request, 'api_devices_deploy_denied', level="warning", username=user.username, rid=rid)
+                return JsonResponse({'error': 'Permission denied'}, status=403)
+            if device and not device.is_active:
+                _log_event(request, 'api_devices_deploy_denied', level="warning", username=user.username, rid=rid, reason='inactive')
+                return JsonResponse({'error': 'Device disabled'}, status=403)
+            if not device:
+                device = RustDeskDevice(
+                    rid=rid,
+                    cpu='-',
+                    hostname='-',
+                    memory='-',
+                    os='-',
+                    uuid=uuid_value,
+                    username='',
+                    version='-',
+                    ip_address=get_client_ip(request),
+                )
+            old_rid = device.rid
+            old_uuid = device.uuid
+            old_key_hash = device.public_key_hash
+            device.rid = rid
+            device.uuid = uuid_value
+            device.public_key_hash = public_key_hash
+            device.owner = user
+            device.ip_address = get_client_ip(request)
+            device.save()
+            if old_rid != rid or old_uuid != uuid_value or (old_key_hash and old_key_hash != public_key_hash):
+                _revoke_device_tokens(device)
+    except IntegrityError:
+        _log_event(request, 'api_devices_deploy_conflict', level="warning", username=user.username, rid=rid)
+        return JsonResponse({'result': 'ID_TAKEN'}, status=409)
 
+    _ensure_personal_device_peer(user, device)
     _log_event(request, 'api_devices_deploy_ok', username=user.username, rid=rid)
     return JsonResponse({'result': 'OK'})
+
+
+def devices_verify_deployment(request):
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    expected_token = settings.DEVICE_VERIFICATION_TOKEN
+    supplied_token = _get_bearer_token(request)
+    if (
+        not expected_token
+        or len(expected_token) < 32
+        or not supplied_token
+        or not secrets.compare_digest(supplied_token, expected_token)
+    ):
+        _log_event(request, 'api_devices_verify_unauthorized', level="warning")
+        return HttpResponse(status=401)
+    if len(request.body) > 4096:
+        return HttpResponse(status=413)
+    postdata = _load_json(request)
+    rid = str(postdata.get('id', '')).strip()
+    uuid_value = str(postdata.get('uuid', '')).strip()
+    public_key_hash = str(postdata.get('public_key_hash', '')).strip().lower()
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", rid)
+        or _decode_canonical_base64(uuid_value, max_decoded_bytes=256) is None
+        or not re.fullmatch(r"[0-9a-f]{64}", public_key_hash)
+    ):
+        return HttpResponse(status=400)
+    authorized = RustDeskDevice.objects.filter(
+        rid=rid,
+        uuid=uuid_value,
+        public_key_hash=public_key_hash,
+        is_active=True,
+        owner__is_active=True,
+    ).exists()
+    return HttpResponse(status=204 if authorized else 404)
 
 
 def plugin_sign(request):
@@ -1152,18 +2053,37 @@ def record(request):
     max_chunk = settings.RECORD_UPLOAD_MAX_CHUNK_BYTES
     if content_length < 0 or content_length > max_chunk:
         return JsonResponse({'error': 'Upload chunk is too large'}, status=413)
-    base_dir = _record_device_dir(token)
-    os.makedirs(base_dir, exist_ok=True)
+    try:
+        base_dir = _ensure_record_device_dir(token)
+    except OSError:
+        _log_event(
+            request,
+            'api_record_storage_error',
+            level="error",
+            username=user.username,
+            rid=token.device.rid,
+        )
+        return JsonResponse({'error': 'Recording storage failed'}, status=500)
     filepath = os.path.join(base_dir, filename)
     if record_type == 'new':
         if content_length != 0:
             return JsonResponse({'error': 'New recording body must be empty'}, status=400)
         try:
-            with open(filepath, 'xb'):
-                pass
+            with _record_file_lock(base_dir, filename):
+                fd = _open_record_file(filepath, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                _fsync_directory(base_dir)
+        except BlockingIOError:
+            return JsonResponse({'error': 'Recording is busy'}, status=423)
         except FileExistsError:
             return JsonResponse({'error': 'Recording already exists'}, status=409)
-        _log_event(request, 'api_record_new', level="info", username=user.username, rid=token.rid, file=filename)
+        except OSError:
+            _log_event(request, 'api_record_storage_error', level="error", username=user.username, rid=token.device.rid)
+            return JsonResponse({'error': 'Recording storage failed'}, status=500)
+        _log_event(request, 'api_record_new', level="info", username=user.username, rid=token.device.rid, file=filename)
         return HttpResponse('')
     if record_type in ('part', 'tail'):
         try:
@@ -1176,26 +2096,36 @@ def record(request):
         data = request.body or b''
         if len(data) != content_length:
             return JsonResponse({'error': 'Incomplete upload body'}, status=400)
+        if record_type == 'tail' and offset != 0:
+            return JsonResponse({'error': 'Invalid tail offset'}, status=400)
         try:
-            current_size = os.path.getsize(filepath)
+            with _record_file_lock(base_dir, filename):
+                fd = _open_record_file(filepath, os.O_RDWR)
+                try:
+                    current_size = os.fstat(fd).st_size
+                    if record_type == 'part':
+                        if offset != current_size:
+                            return JsonResponse({'error': 'Upload offset conflict'}, status=409)
+                        if current_size + len(data) > settings.RECORD_UPLOAD_MAX_FILE_BYTES:
+                            return JsonResponse({'error': 'Recording is too large'}, status=413)
+                    os.lseek(fd, offset, os.SEEK_SET)
+                    _write_all(fd, data)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        except BlockingIOError:
+            return JsonResponse({'error': 'Recording is busy'}, status=423)
         except FileNotFoundError:
             return JsonResponse({'error': 'Recording does not exist'}, status=404)
-        if record_type == 'part':
-            if offset != current_size:
-                return JsonResponse({'error': 'Upload offset conflict'}, status=409)
-            if current_size + len(data) > settings.RECORD_UPLOAD_MAX_FILE_BYTES:
-                return JsonResponse({'error': 'Recording is too large'}, status=413)
-        elif offset != 0:
-            return JsonResponse({'error': 'Invalid tail offset'}, status=400)
-        with open(filepath, 'r+b') as f:
-            f.seek(offset)
-            f.write(data)
+        except OSError:
+            _log_event(request, 'api_record_storage_error', level="error", username=user.username, rid=token.device.rid)
+            return JsonResponse({'error': 'Recording storage failed'}, status=500)
         _log_event(
             request,
             'api_record_write',
             level="debug",
             username=user.username,
-            rid=token.rid,
+            rid=token.device.rid,
             file=filename,
             offset=offset,
             size=len(data),
@@ -1205,10 +2135,20 @@ def record(request):
         if content_length != 0:
             return JsonResponse({'error': 'Remove recording body must be empty'}, status=400)
         try:
-            os.remove(filepath)
+            with _record_file_lock(base_dir, filename):
+                file_stat = os.lstat(filepath)
+                if not stat.S_ISREG(file_stat.st_mode):
+                    return JsonResponse({'error': 'Invalid recording path'}, status=400)
+                os.unlink(filepath)
+                _fsync_directory(base_dir)
+        except BlockingIOError:
+            return JsonResponse({'error': 'Recording is busy'}, status=423)
         except FileNotFoundError:
             pass
-        _log_event(request, 'api_record_remove', level="info", username=user.username, rid=token.rid, file=filename)
+        except OSError:
+            _log_event(request, 'api_record_storage_error', level="error", username=user.username, rid=token.device.rid)
+            return JsonResponse({'error': 'Recording storage failed'}, status=500)
+        _log_event(request, 'api_record_remove', level="info", username=user.username, rid=token.device.rid, file=filename)
         return HttpResponse('')
     return JsonResponse({'error': 'Invalid type'}, status=400)
 
@@ -1236,23 +2176,29 @@ def audit_note(request):
         _log_event(request, 'api_audit_note_invalid_method', level="warning")
         return JsonResponse({'error': _('请求方式错误！')}, status=405)
     token, user = _get_token_user(request)
-    if not user:
+    if not token or not user or not _get_active_token_device(token, user):
         _log_event(request, 'api_audit_note_unauthorized', level="warning")
         return JsonResponse({'error': 'Invalid token'}, status=401)
     postdata = _load_json(request)
     guid = postdata.get('guid', '')
     note = postdata.get('note', '')
-    if not isinstance(guid, str) or not guid or not isinstance(note, str):
+    if not isinstance(guid, str) or not isinstance(note, str):
         _log_event(request, 'api_audit_note_invalid_guid', level="warning")
+        return JsonResponse({'error': 'Invalid audit note'}, status=400)
+    try:
+        parsed_guid = uuid.UUID(guid)
+    except (ValueError, AttributeError):
         return JsonResponse({'error': 'Invalid audit note'}, status=400)
     if len(note.encode()) > MAX_AUDIT_NOTE_BYTES:
         return JsonResponse({'error': 'Audit note is too large'}, status=413)
-    sessions = AuditSession.objects.filter(Q(guid=guid))
-    if not user.is_admin:
-        sessions = sessions.filter(Q(actor=user))
-    if sessions.update(note=note) != 1:
+    updated = ConnLog.objects.filter(
+        guid=parsed_guid,
+        actor=user,
+        from_id=token.device.rid,
+    ).update(note=note)
+    if updated != 1:
         _log_event(request, 'api_audit_note_denied', level="warning", username=user.username, guid=guid)
-        return JsonResponse({'error': 'Audit session not found'}, status=404)
+        return JsonResponse({'error': 'Connection audit not found'}, status=404)
     _log_event(request, 'api_audit_note_update', username=user.username, guid=guid)
     return JsonResponse({'code': 1, 'data': 'ok'})
 
@@ -1264,15 +2210,23 @@ def audit_root(request):
 
 
 def ab_settings(request):
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_settings_unauthorized', level="warning")
         return JsonResponse({'error': 'Invalid token'}, status=401)
     _log_event(request, 'api_ab_settings', level="debug", username=user.username)
-    return JsonResponse({'max_peer_one_ab': 0})
+    return JsonResponse({
+        'max_peer_one_ab': MAX_AB_PEERS,
+        'max_tag_one_ab': MAX_AB_TAGS,
+        'max_tag_one_peer': MAX_AB_TAGS_PER_PEER,
+    })
 
 
 def ab_personal(request):
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_personal_unauthorized', level="warning")
@@ -1283,6 +2237,8 @@ def ab_personal(request):
 
 
 def ab_shared_profiles(request):
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_shared_profiles_unauthorized', level="warning")
@@ -1293,10 +2249,7 @@ def ab_shared_profiles(request):
     def add_profile(p, rule_value):
         if not p or _is_personal_guid(p.guid):
             return
-        try:
-            info = json.loads(p.info) if p.info else None
-        except Exception:
-            info = p.info
+        info = p.info
         owner_name = p.owner.username if p.owner else ''
         existing = items.get(p.guid)
         rule_value = int(rule_value or 0)
@@ -1338,9 +2291,9 @@ def ab_shared_profiles(request):
 
 
 def ab_shared_add(request):
-    if request.method == 'GET':
+    if request.method != 'POST':
         _log_event(request, 'api_ab_shared_add_invalid_method', level="warning")
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')})
+        return JsonResponse({'error': 'POST required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_shared_add_unauthorized', level="warning")
@@ -1349,36 +2302,35 @@ def ab_shared_add(request):
     name = str(postdata.get('name', '')).strip()
     note = postdata.get('note', '')
     info = postdata.get('info', None)
-    if not name:
+    if (
+        not name
+        or len(name) > 60
+        or _bounded_text_value(note, 4096) is None
+    ):
         _log_event(request, 'api_ab_shared_add_failed', level="warning", username=user.username, reason='missing_name')
         return JsonResponse({'error': 'Invalid name'}, status=400)
     if _is_reserved_ab_profile_name(name):
         return JsonResponse({'error': 'Reserved name'}, status=400)
-    profile = AddressBookProfile.objects.filter(Q(owner=user) & Q(name=name)).first()
-    if not profile:
-        profile = AddressBookProfile(
-            guid=uuid.uuid4().hex,
-            name=name,
-            owner=user,
-            rule=3,
-            note=note or '',
-        )
+    profile = _get_or_create_profile(user, name)
+    profile.note = note
     if info is not None:
-        if isinstance(info, (dict, list)):
-            profile.info = json.dumps(info, ensure_ascii=False)
-        else:
-            profile.info = str(info)
-    if note is not None:
-        profile.note = note
+        info = _json_value(
+            info,
+            expected_type=(dict, list),
+            max_bytes=16 * 1024,
+        )
+        if info is None:
+            return JsonResponse({'error': 'Invalid info'}, status=400)
+        profile.info = info
     profile.save()
     _log_event(request, 'api_ab_shared_add', username=user.username, guid=profile.guid, name=name)
     return JsonResponse({'code': 1, 'guid': profile.guid})
 
 
 def ab_shared_update_profile(request):
-    if request.method == 'GET':
+    if request.method != 'PUT':
         _log_event(request, 'api_ab_shared_update_invalid_method', level="warning")
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')})
+        return JsonResponse({'error': 'PUT required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_shared_update_unauthorized', level="warning")
@@ -1394,32 +2346,67 @@ def ab_shared_update_profile(request):
         return JsonResponse({'error': 'Personal address book cannot be modified'}, status=403)
     if not user.is_admin and str(profile.owner_id) != str(user.id):
         return JsonResponse({'error': 'No access'}, status=403)
-    if 'name' in postdata and postdata.get('name'):
-        profile.name = postdata.get('name')
+    if 'name' in postdata:
+        name = str(postdata.get('name') or '').strip()
+        if (
+            not name
+            or len(name) > 60
+            or _is_reserved_ab_profile_name(name)
+            or AddressBookProfile.objects.filter(owner=profile.owner, name=name)
+            .exclude(pk=profile.pk)
+            .exists()
+        ):
+            return JsonResponse({'error': 'Invalid or duplicate name'}, status=400)
+        profile.name = name
     if 'note' in postdata and postdata.get('note') is not None:
-        profile.note = postdata.get('note')
+        note = _bounded_text_value(postdata.get('note'), 4096)
+        if note is None:
+            return JsonResponse({'error': 'Invalid note'}, status=400)
+        profile.note = note
     if 'info' in postdata and postdata.get('info') is not None:
-        info = postdata.get('info')
-        if isinstance(info, (dict, list)):
-            profile.info = json.dumps(info, ensure_ascii=False)
-        else:
-            profile.info = str(info)
+        info = _json_value(
+            postdata.get('info'),
+            expected_type=(dict, list),
+            max_bytes=16 * 1024,
+        )
+        if info is None:
+            return JsonResponse({'error': 'Invalid info'}, status=400)
+        profile.info = info
+    new_owner = None
     if 'owner' in postdata and postdata.get('owner'):
         if not user.is_admin:
             return JsonResponse({'error': 'Only admin can transfer owner'}, status=403)
-        owner = UserProfile.objects.filter(Q(username=postdata.get('owner')) | Q(id=postdata.get('owner'))).first()
-        if not owner:
+        new_owner = _user_by_identifier(
+            postdata.get('owner'),
+            active_only=True,
+        )
+        if not new_owner:
             return JsonResponse({'error': 'Owner not found'}, status=404)
-        profile.owner = owner
-    profile.save()
+        if AddressBookProfile.objects.filter(owner=new_owner, name=profile.name).exclude(pk=profile.pk).exists():
+            return JsonResponse({'error': 'Owner already has an address book with this name'}, status=409)
+    profile_values = {
+        'name': profile.name,
+        'note': profile.note,
+        'info': profile.info,
+    }
+    with transaction.atomic():
+        profile = AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+        profile.name = profile_values['name']
+        profile.note = profile_values['note']
+        profile.info = profile_values['info']
+        old_owner_id = profile.owner_id
+        if new_owner and new_owner.id != old_owner_id:
+            profile.owner = new_owner
+            AddressBookShare.objects.filter(profile=profile, user=new_owner).delete()
+        profile.save()
     _log_event(request, 'api_ab_shared_update', username=user.username, guid=guid)
     return JsonResponse({'code': 1, 'data': 'ok'})
 
 
 def ab_shared_delete(request):
-    if request.method == 'GET':
+    if request.method != 'DELETE':
         _log_event(request, 'api_ab_shared_delete_invalid_method', level="warning")
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')})
+        return JsonResponse({'error': 'DELETE required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_shared_delete_unauthorized', level="warning")
@@ -1427,21 +2414,16 @@ def ab_shared_delete(request):
     postdata = _load_json(request)
     if not isinstance(postdata, list):
         return JsonResponse({'error': 'Invalid data'}, status=400)
-    deleted = 0
-    for guid in postdata:
-        profile = AddressBookProfile.objects.filter(Q(guid=guid)).first()
-        if not profile:
-            continue
-        if _is_personal_guid(profile.guid):
-            continue
-        if not user.is_admin and str(profile.owner_id) != str(user.id):
-            continue
-        RustDeskPeer.objects.filter(Q(profile_guid=guid)).delete()
-        RustDeskTag.objects.filter(Q(profile_guid=guid)).delete()
-        AddressBookRule.objects.filter(Q(profile=profile)).delete()
-        AddressBookShare.objects.filter(Q(profile=profile)).delete()
-        profile.delete()
-        deleted += 1
+    if len(postdata) > 100:
+        return JsonResponse({'error': 'Too many address books'}, status=400)
+    candidates = AddressBookProfile.objects.filter(guid__in=[str(x) for x in postdata])
+    if not user.is_admin:
+        candidates = candidates.filter(owner=user)
+    candidates = candidates.exclude(guid__startswith='personal-')
+    guids = list(candidates.values_list('guid', flat=True))
+    with transaction.atomic():
+        candidates.delete()
+        deleted = len(guids)
     _log_event(request, 'api_ab_shared_delete', username=user.username, count=deleted)
     return JsonResponse({'code': 1, 'deleted': deleted})
 
@@ -1449,6 +2431,8 @@ def ab_shared_delete(request):
 def ab_rules(request):
     if request.method == 'DELETE':
         return ab_rules_delete(request)
+    if request.method != 'GET':
+        return JsonResponse({'error': 'GET or DELETE required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         session_user = getattr(request, 'user', None)
@@ -1459,8 +2443,12 @@ def ab_rules(request):
     guid = request.GET.get('ab', '') or request.GET.get('guid', '')
     if not guid:
         return JsonResponse({'error': 'Invalid guid'}, status=400)
+    if _is_personal_guid(guid):
+        return JsonResponse({'error': 'Personal address book cannot be shared'}, status=403)
     profile, owner, rule = _get_profile_access(user, guid)
-    if not owner and not user.is_admin:
+    if not profile:
+        return JsonResponse({'error': 'Not found'}, status=404)
+    if not user.is_admin and str(profile.owner_id) != str(user.id):
         _log_event(request, 'api_ab_rules_denied', level="warning", username=user.username, guid=guid)
         return JsonResponse({'error': 'No access'}, status=403)
     current, page_size, _start, _end = _pagination(request)
@@ -1492,12 +2480,14 @@ def ab_rule(request):
     if not user:
         _log_event(request, 'api_ab_rule_unauthorized', level="warning")
         return JsonResponse({'error': 'Invalid token'}, status=401)
-    if request.method == 'GET':
-        return JsonResponse({'error': _('请求方式错误！')}, status=405)
+    if request.method not in ('POST', 'PATCH'):
+        return JsonResponse({'error': 'POST or PATCH required'}, status=405)
     postdata = _load_json(request)
     if request.method == 'POST':
         guid = postdata.get('guid', '')
-        rule_value = int(postdata.get('rule', 1) or 1)
+        rule_value = _valid_ab_rule(postdata.get('rule', 1))
+        if rule_value is None:
+            return JsonResponse({'error': 'Invalid rule'}, status=400)
         if not guid:
             return JsonResponse({'error': 'Invalid guid'}, status=400)
         profile = AddressBookProfile.objects.filter(Q(guid=guid)).first()
@@ -1509,50 +2499,60 @@ def ab_rule(request):
             return JsonResponse({'error': 'No access'}, status=403)
         user_name = postdata.get('user', '')
         group_name = postdata.get('group', '')
+        if user_name and group_name:
+            return JsonResponse(
+                {'error': 'Specify exactly one rule target'},
+                status=400,
+            )
         if user_name:
-            target_user = UserProfile.objects.filter(Q(username=user_name) | Q(id=user_name)).first()
+            target_user = _user_by_identifier(user_name, active_only=True)
             if not target_user:
                 return JsonResponse({'error': 'User not found'}, status=404)
-            share = AddressBookShare.objects.filter(Q(profile=profile) & Q(user=target_user)).first()
-            created = False
-            if not share:
-                share = AddressBookShare(profile=profile, user=target_user, rule=rule_value)
-                created = True
-            else:
-                share.rule = rule_value
-            share.save()
-            _audit_ab_rule(profile, user, 'share_add' if created else 'share_update', 'user', target_user.username, rule_value, {'guid': share.guid})
+            if target_user.id == profile.owner_id:
+                return JsonResponse({'error': 'Owner already has full access'}, status=400)
+            share, created = AddressBookShare.objects.update_or_create(
+                profile=profile,
+                user=target_user,
+                defaults={'rule': rule_value},
+            )
+            _audit_ab_rule(profile, user, 'share_add' if created else 'share_update', 'user', target_user.username, rule_value, {'guid': str(share.guid)})
             _log_event(request, 'api_ab_rule_add', username=user.username, guid=guid, rule=rule_value, user=target_user.username)
             return JsonResponse({'guid': share.guid, 'rule': share.rule})
         if group_name:
             group = Group.objects.filter(Q(name=group_name)).first()
             if not group:
                 return JsonResponse({'error': 'Group not found'}, status=404)
-            rule_obj = AddressBookRule.objects.filter(Q(profile=profile) & Q(group=group)).first()
-            created = False
-            if not rule_obj:
-                rule_obj = AddressBookRule(profile=profile, group=group, rule=rule_value, is_everyone=False)
-                created = True
-            else:
-                rule_obj.rule = rule_value
-            rule_obj.save()
-            _audit_ab_rule(profile, user, 'rule_add' if created else 'rule_update', 'group', group.name, rule_value, {'guid': rule_obj.guid})
+            rule_obj, created = AddressBookRule.objects.update_or_create(
+                profile=profile,
+                target_key=f'group:{group.id}',
+                defaults={
+                    'group': group,
+                    'user': None,
+                    'rule': rule_value,
+                    'is_everyone': False,
+                },
+            )
+            _audit_ab_rule(profile, user, 'rule_add' if created else 'rule_update', 'group', group.name, rule_value, {'guid': str(rule_obj.guid)})
             _log_event(request, 'api_ab_rule_add', username=user.username, guid=guid, rule=rule_value, group=group.name)
             return JsonResponse({'guid': rule_obj.guid, 'rule': rule_obj.rule})
-        rule_obj = AddressBookRule.objects.filter(Q(profile=profile) & Q(is_everyone=True)).first()
-        created = False
-        if not rule_obj:
-            rule_obj = AddressBookRule(profile=profile, rule=rule_value, is_everyone=True)
-            created = True
-        else:
-            rule_obj.rule = rule_value
-        rule_obj.save()
-        _audit_ab_rule(profile, user, 'rule_add' if created else 'rule_update', 'everyone', 'Everyone', rule_value, {'guid': rule_obj.guid})
+        rule_obj, created = AddressBookRule.objects.update_or_create(
+            profile=profile,
+            target_key='everyone',
+            defaults={
+                'group': None,
+                'user': None,
+                'rule': rule_value,
+                'is_everyone': True,
+            },
+        )
+        _audit_ab_rule(profile, user, 'rule_add' if created else 'rule_update', 'everyone', 'Everyone', rule_value, {'guid': str(rule_obj.guid)})
         _log_event(request, 'api_ab_rule_add', username=user.username, guid=guid, rule=rule_value, target='everyone')
         return JsonResponse({'guid': rule_obj.guid, 'rule': rule_obj.rule})
     if request.method == 'PATCH':
         rule_guid = postdata.get('guid', '')
-        rule_value = int(postdata.get('rule', 1) or 1)
+        rule_value = _valid_ab_rule(postdata.get('rule', 1))
+        if rule_value is None:
+            return JsonResponse({'error': 'Invalid rule'}, status=400)
         if not rule_guid:
             return JsonResponse({'error': 'Invalid guid'}, status=400)
         share = AddressBookShare.objects.filter(Q(guid=rule_guid)).select_related('profile').first()
@@ -1563,7 +2563,7 @@ def ab_rule(request):
             share.rule = rule_value
             share.save()
             target_name = share.user.username if share.user else ''
-            _audit_ab_rule(profile, user, 'share_update', 'user', target_name, rule_value, {'guid': share.guid})
+            _audit_ab_rule(profile, user, 'share_update', 'user', target_name, rule_value, {'guid': str(share.guid)})
             _log_event(request, 'api_ab_rule_update', username=user.username, guid=rule_guid, rule=rule_value)
             return JsonResponse({'code': 1})
         rule_obj = AddressBookRule.objects.filter(Q(guid=rule_guid)).select_related('profile').first()
@@ -1583,16 +2583,16 @@ def ab_rule(request):
         else:
             target_type = 'user'
             target_name = rule_obj.user.username if rule_obj.user else ''
-        _audit_ab_rule(profile, user, 'rule_update', target_type, target_name, rule_value, {'guid': rule_obj.guid})
+        _audit_ab_rule(profile, user, 'rule_update', target_type, target_name, rule_value, {'guid': str(rule_obj.guid)})
         _log_event(request, 'api_ab_rule_update', username=user.username, guid=rule_guid, rule=rule_value)
         return JsonResponse({'code': 1})
     return JsonResponse({'error': _('请求方式错误！')}, status=405)
 
 
 def ab_rules_delete(request):
-    if request.method == 'GET':
+    if request.method != 'DELETE':
         _log_event(request, 'api_ab_rules_delete_invalid_method', level="warning")
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')})
+        return JsonResponse({'error': 'DELETE required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_rules_delete_unauthorized', level="warning")
@@ -1600,6 +2600,8 @@ def ab_rules_delete(request):
     postdata = _load_json(request)
     if not isinstance(postdata, list):
         return JsonResponse({'error': 'Invalid data'}, status=400)
+    if len(postdata) > 100:
+        return JsonResponse({'error': 'Too many rules'}, status=400)
     deleted = 0
     for rule_guid in postdata:
         share = AddressBookShare.objects.filter(Q(guid=rule_guid)).select_related('profile').first()
@@ -1607,7 +2609,7 @@ def ab_rules_delete(request):
             profile = share.profile
             if user.is_admin or str(profile.owner_id) == str(user.id):
                 target_name = share.user.username if share.user else ''
-                _audit_ab_rule(profile, user, 'share_delete', 'user', target_name, share.rule, {'guid': share.guid})
+                _audit_ab_rule(profile, user, 'share_delete', 'user', target_name, share.rule, {'guid': str(share.guid)})
                 share.delete()
                 deleted += 1
             continue
@@ -1624,7 +2626,7 @@ def ab_rules_delete(request):
                 else:
                     target_type = 'user'
                     target_name = rule_obj.user.username if rule_obj.user else ''
-                _audit_ab_rule(profile, user, 'rule_delete', target_type, target_name, rule_obj.rule, {'guid': rule_obj.guid})
+                _audit_ab_rule(profile, user, 'rule_delete', target_type, target_name, rule_obj.rule, {'guid': str(rule_obj.guid)})
                 rule_obj.delete()
                 deleted += 1
     _log_event(request, 'api_ab_rules_delete', username=user.username, count=deleted)
@@ -1632,6 +2634,8 @@ def ab_rules_delete(request):
 
 
 def ab_peers(request):
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_peers_unauthorized', level="warning")
@@ -1645,14 +2649,24 @@ def ab_peers(request):
         _log_event(request, 'api_ab_peers_denied', level="warning", username=user.username, guid=guid)
         return JsonResponse({'error': 'No access'}, status=403)
     current, page_size, _start, _end = _pagination(request)
-    qs = RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(profile_guid=guid)).order_by('rid')
+    qs = (
+        RustDeskPeer.objects.filter(profile=profile)
+        .prefetch_related(
+            Prefetch(
+                'tags',
+                queryset=RustDeskTag.objects.order_by('tag_name'),
+                to_attr='ordered_tags',
+            )
+        )
+        .order_by('rid')
+    )
     total = qs.count()
     start = (current - 1) * page_size
     end = start + page_size
     data = []
     is_personal = guid == _personal_guid(owner)
     for p in qs[start:end]:
-        tags = [x for x in p.tags.split(',') if x]
+        tags = [tag.tag_name for tag in p.ordered_tags]
         item = {
             'id': p.rid,
             'username': p.username,
@@ -1677,6 +2691,8 @@ def ab_peers(request):
 
 
 def ab_tags(request, guid):
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_tags_unauthorized', level="warning")
@@ -1688,12 +2704,12 @@ def ab_tags(request, guid):
     if not owner:
         _log_event(request, 'api_ab_tags_denied', level="warning", username=user.username, guid=guid)
         return JsonResponse({'error': 'No access'}, status=403)
-    tags = RustDeskTag.objects.filter(Q(uid=owner.id) & Q(profile_guid=guid))
+    tags = RustDeskTag.objects.filter(profile=profile)
     data = []
     for t in tags:
         try:
             color = int(t.tag_color)
-        except Exception:
+        except (TypeError, ValueError):
             color = 0
         data.append({'name': t.tag_name, 'color': color})
     _log_event(request, 'api_ab_tags', level="debug", username=user.username, guid=guid, total=len(data))
@@ -1701,16 +2717,16 @@ def ab_tags(request, guid):
 
 
 def ab_peer_add(request, guid):
-    if request.method == 'GET':
+    if request.method != 'POST':
         _log_event(request, 'api_ab_peer_add_invalid_method', level="warning", guid=guid)
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')})
+        return JsonResponse({'error': 'POST required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_peer_add_unauthorized', level="warning", guid=guid)
         return JsonResponse({'error': 'Invalid token'}, status=401)
     profile, owner, rule = _get_profile_access(user, guid)
     if guid == _personal_guid(user):
-        _ensure_personal_profile(user)
+        profile = _ensure_personal_profile(user)
         owner = user
         rule = 3
     if not owner:
@@ -1720,25 +2736,48 @@ def ab_peer_add(request, guid):
         _log_event(request, 'api_ab_peer_add_denied', level="warning", username=user.username, guid=guid, reason='read_only')
         return JsonResponse({'error': 'Read-only'}, status=403)
     postdata = _load_json(request)
-    rid = postdata.get('id', '')
-    if not rid:
+    payload = _validated_peer_payload(
+        postdata,
+        guid == _personal_guid(owner),
+    )
+    if payload is None:
         _log_event(request, 'api_ab_peer_add_failed', level="warning", username=user.username, guid=guid, reason='missing_id')
-        return JsonResponse({'error': 'ID_NOT_FOUND'}, status=400)
+        return JsonResponse({'error': 'Invalid peer'}, status=400)
+    rid = payload['id']
     is_personal = guid == _personal_guid(owner)
-    peer_data = dict(postdata)
+    peer_data = payload
     if is_personal:
         peer_data.pop('password', None)
     else:
         peer_data.pop('hash', None)
-    _upsert_ab_peer(owner, guid, rid, peer_data, is_personal)
+    try:
+        with transaction.atomic():
+            AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+            existing = RustDeskPeer.objects.filter(
+                profile=profile,
+                rid=rid,
+            ).exists()
+            if (
+                not existing
+                and RustDeskPeer.objects.filter(
+                    profile=profile,
+                ).count() >= MAX_AB_PEERS
+            ):
+                return JsonResponse(
+                    {'error': 'Address book peer limit reached'},
+                    status=409,
+                )
+            _upsert_ab_peer(profile, rid, peer_data, is_personal)
+    except ValueError:
+        return JsonResponse({'error': 'Invalid peer'}, status=400)
     _log_event(request, 'api_ab_peer_add', username=user.username, guid=guid, rid=rid)
     return HttpResponse('')
 
 
 def ab_peer_update(request, guid):
-    if request.method == 'GET':
+    if request.method != 'PUT':
         _log_event(request, 'api_ab_peer_update_invalid_method', level="warning", guid=guid)
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')})
+        return JsonResponse({'error': 'PUT required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_peer_update_unauthorized', level="warning", guid=guid)
@@ -1755,29 +2794,33 @@ def ab_peer_update(request, guid):
         _log_event(request, 'api_ab_peer_update_denied', level="warning", username=user.username, guid=guid, reason='read_only')
         return JsonResponse({'error': 'Read-only'}, status=403)
     postdata = _load_json(request)
-    rid = postdata.get('id', '')
-    if not rid:
-        _log_event(request, 'api_ab_peer_update_failed', level="warning", username=user.username, guid=guid, reason='missing_id')
-        return JsonResponse({'error': 'ID_NOT_FOUND'}, status=400)
     is_personal = guid == _personal_guid(owner)
-    peer_data = dict(postdata)
+    payload = _validated_peer_payload(postdata, is_personal)
+    if payload is None:
+        _log_event(request, 'api_ab_peer_update_failed', level="warning", username=user.username, guid=guid, reason='missing_id')
+        return JsonResponse({'error': 'Invalid peer'}, status=400)
+    rid = payload['id']
+    peer_data = payload
     if is_personal:
         peer_data.pop('password', None)
     else:
         peer_data.pop('hash', None)
-    peer = RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(rid=rid) & Q(profile_guid=guid)).first()
+    peer = RustDeskPeer.objects.filter(profile=profile, rid=rid).first()
     if not peer:
         _log_event(request, 'api_ab_peer_update_failed', level="warning", username=user.username, guid=guid, rid=rid, reason='not_found')
         return JsonResponse({'error': 'ID_NOT_FOUND'}, status=404)
-    _upsert_ab_peer(owner, guid, rid, peer_data, is_personal)
+    try:
+        _upsert_ab_peer(profile, rid, peer_data, is_personal)
+    except ValueError:
+        return JsonResponse({'error': 'Invalid peer'}, status=400)
     _log_event(request, 'api_ab_peer_update', username=user.username, guid=guid, rid=rid)
     return HttpResponse('')
 
 
 def ab_peer_delete(request, guid):
-    if request.method == 'GET':
+    if request.method != 'DELETE':
         _log_event(request, 'api_ab_peer_delete_invalid_method', level="warning", guid=guid)
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')})
+        return JsonResponse({'error': 'DELETE required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_peer_delete_unauthorized', level="warning", guid=guid)
@@ -1794,25 +2837,32 @@ def ab_peer_delete(request, guid):
         _log_event(request, 'api_ab_peer_delete_denied', level="warning", username=user.username, guid=guid, reason='read_only')
         return JsonResponse({'error': 'Read-only'}, status=403)
     postdata = _load_json(request)
-    if not isinstance(postdata, list):
+    if (
+        not isinstance(postdata, list)
+        or len(postdata) > 1000
+        or any(
+            _bounded_text_value(value, 1024, False) is None
+            for value in postdata
+        )
+    ):
         _log_event(request, 'api_ab_peer_delete_failed', level="warning", username=user.username, guid=guid, reason='invalid_ids')
         return JsonResponse({'error': 'Invalid ids'}, status=400)
-    RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(profile_guid=guid) & Q(rid__in=postdata)).delete()
+    RustDeskPeer.objects.filter(profile=profile, rid__in=postdata).delete()
     _log_event(request, 'api_ab_peer_delete', username=user.username, guid=guid, count=len(postdata))
     return HttpResponse('')
 
 
 def ab_tag_add(request, guid):
-    if request.method == 'GET':
+    if request.method != 'POST':
         _log_event(request, 'api_ab_tag_add_invalid_method', level="warning", guid=guid)
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')})
+        return JsonResponse({'error': 'POST required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_tag_add_unauthorized', level="warning", guid=guid)
         return JsonResponse({'error': 'Invalid token'}, status=401)
     profile, owner, rule = _get_profile_access(user, guid)
     if guid == _personal_guid(user):
-        _ensure_personal_profile(user)
+        profile = _ensure_personal_profile(user)
         owner = user
         rule = 3
     if not owner:
@@ -1822,21 +2872,43 @@ def ab_tag_add(request, guid):
         _log_event(request, 'api_ab_tag_add_denied', level="warning", username=user.username, guid=guid, reason='read_only')
         return JsonResponse({'error': 'Read-only'}, status=403)
     postdata = _load_json(request)
-    name = postdata.get('name', '')
-    color = postdata.get('color', '')
-    if not name:
+    name = str(postdata.get('name', '')).strip()
+    color = normalize_tag_color(postdata.get('color', ''))
+    if (
+        _bounded_text_value(name, 256, False) is None
+        or len(name) > 64
+        or color is None
+    ):
         _log_event(request, 'api_ab_tag_add_failed', level="warning", username=user.username, guid=guid, reason='missing_name')
         return JsonResponse({'error': 'Invalid tag'}, status=400)
-    if not RustDeskTag.objects.filter(Q(uid=owner.id) & Q(tag_name=name) & Q(profile_guid=guid)).first():
-        RustDeskTag(uid=owner.id, tag_name=name, tag_color=str(color), profile_guid=guid).save()
+    with transaction.atomic():
+        AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+        if (
+            not RustDeskTag.objects.filter(
+                profile=profile,
+                tag_name=name,
+            ).exists()
+            and RustDeskTag.objects.filter(
+                profile=profile,
+            ).count() >= MAX_AB_TAGS
+        ):
+            return JsonResponse(
+                {'error': 'Address book tag limit reached'},
+                status=409,
+            )
+        RustDeskTag.objects.get_or_create(
+            profile=profile,
+            tag_name=name,
+            defaults={'tag_color': color},
+        )
     _log_event(request, 'api_ab_tag_add', username=user.username, guid=guid, tag=name)
     return HttpResponse('')
 
 
 def ab_tag_rename(request, guid):
-    if request.method == 'GET':
+    if request.method != 'PUT':
         _log_event(request, 'api_ab_tag_rename_invalid_method', level="warning", guid=guid)
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')})
+        return JsonResponse({'error': 'PUT required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_tag_rename_unauthorized', level="warning", guid=guid)
@@ -1853,27 +2925,41 @@ def ab_tag_rename(request, guid):
         _log_event(request, 'api_ab_tag_rename_denied', level="warning", username=user.username, guid=guid, reason='read_only')
         return JsonResponse({'error': 'Read-only'}, status=403)
     postdata = _load_json(request)
-    old = postdata.get('old', '')
-    new = postdata.get('new', '')
-    if not old or not new:
+    old = str(postdata.get('old', '')).strip()
+    new = str(postdata.get('new', '')).strip()
+    if (
+        _bounded_text_value(old, 256, False) is None
+        or _bounded_text_value(new, 256, False) is None
+        or len(old) > 64
+        or len(new) > 64
+    ):
         _log_event(request, 'api_ab_tag_rename_failed', level="warning", username=user.username, guid=guid, reason='invalid_tag')
         return JsonResponse({'error': 'Invalid tag'}, status=400)
-    RustDeskTag.objects.filter(Q(uid=owner.id) & Q(tag_name=old) & Q(profile_guid=guid)).update(tag_name=new)
-    peers = RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(profile_guid=guid))
-    for p in peers:
-        tags = [x for x in p.tags.split(',') if x]
-        if old in tags:
-            tags = [new if x == old else x for x in tags]
-            p.tags = ','.join(tags)
-            p.save()
+    with transaction.atomic():
+        old_tag = RustDeskTag.objects.select_for_update().filter(
+            profile=profile,
+            tag_name=old,
+        ).first()
+        if not old_tag:
+            return JsonResponse({'error': 'Tag not found'}, status=404)
+        target = RustDeskTag.objects.filter(
+            profile=profile,
+            tag_name=new,
+        ).first()
+        if target and target.pk != old_tag.pk:
+            target.peers.add(*old_tag.peers.all())
+            old_tag.delete()
+        else:
+            old_tag.tag_name = new
+            old_tag.save(update_fields=['tag_name'])
     _log_event(request, 'api_ab_tag_rename', username=user.username, guid=guid, old=old, new=new)
     return HttpResponse('')
 
 
 def ab_tag_update(request, guid):
-    if request.method == 'GET':
+    if request.method != 'PUT':
         _log_event(request, 'api_ab_tag_update_invalid_method', level="warning", guid=guid)
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')})
+        return JsonResponse({'error': 'PUT required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_tag_update_unauthorized', level="warning", guid=guid)
@@ -1890,20 +2976,26 @@ def ab_tag_update(request, guid):
         _log_event(request, 'api_ab_tag_update_denied', level="warning", username=user.username, guid=guid, reason='read_only')
         return JsonResponse({'error': 'Read-only'}, status=403)
     postdata = _load_json(request)
-    name = postdata.get('name', '')
-    color = postdata.get('color', '')
-    if not name:
+    name = str(postdata.get('name', '')).strip()
+    color = normalize_tag_color(postdata.get('color', ''))
+    if (
+        _bounded_text_value(name, 256, False) is None
+        or len(name) > 64
+        or color is None
+    ):
         _log_event(request, 'api_ab_tag_update_failed', level="warning", username=user.username, guid=guid, reason='missing_name')
         return JsonResponse({'error': 'Invalid tag'}, status=400)
-    RustDeskTag.objects.filter(Q(uid=owner.id) & Q(tag_name=name) & Q(profile_guid=guid)).update(tag_color=str(color))
+    RustDeskTag.objects.filter(profile=profile, tag_name=name).update(
+        tag_color=str(color),
+    )
     _log_event(request, 'api_ab_tag_update', username=user.username, guid=guid, tag=name)
     return HttpResponse('')
 
 
 def ab_tag_delete(request, guid):
-    if request.method == 'GET':
+    if request.method != 'DELETE':
         _log_event(request, 'api_ab_tag_delete_invalid_method', level="warning", guid=guid)
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')})
+        return JsonResponse({'error': 'DELETE required'}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_ab_tag_delete_unauthorized', level="warning", guid=guid)
@@ -1920,15 +3012,20 @@ def ab_tag_delete(request, guid):
         _log_event(request, 'api_ab_tag_delete_denied', level="warning", username=user.username, guid=guid, reason='read_only')
         return JsonResponse({'error': 'Read-only'}, status=403)
     postdata = _load_json(request)
-    if not isinstance(postdata, list):
+    if (
+        not isinstance(postdata, list)
+        or len(postdata) > MAX_AB_TAGS
+        or any(
+            _bounded_text_value(value, 256, False) is None
+            for value in postdata
+        )
+    ):
         _log_event(request, 'api_ab_tag_delete_failed', level="warning", username=user.username, guid=guid, reason='invalid_tags')
         return JsonResponse({'error': 'Invalid tags'}, status=400)
-    RustDeskTag.objects.filter(Q(uid=owner.id) & Q(profile_guid=guid) & Q(tag_name__in=postdata)).delete()
-    peers = RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(profile_guid=guid))
-    for p in peers:
-        tags = [x for x in p.tags.split(',') if x and x not in postdata]
-        p.tags = ','.join(tags)
-        p.save()
+    RustDeskTag.objects.filter(
+        profile=profile,
+        tag_name__in=postdata,
+    ).delete()
     _log_event(request, 'api_ab_tag_delete', username=user.username, guid=guid, count=len(postdata))
     return HttpResponse('')
 
@@ -1953,93 +3050,125 @@ def _bounded_audit_text(value, max_bytes):
     return value
 
 
+def _audit_rid(value):
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{6,16}", value):
+        return value
+    return None
+
+
+def _audit_connection_id(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 1 <= value <= 2_147_483_647 else None
+
+
+def _audit_session_id(value):
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    text = str(value)
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", text):
+        return None
+    try:
+        numeric = int(text)
+    except ValueError:
+        return None
+    return text if numeric <= 18_446_744_073_709_551_615 else None
+
+
+def _audit_ip(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return None
+
+
+def _audit_enum(value, allowed):
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed in allowed else None
+
+
 def _audit_conn_active(request):
     token, user = _get_token_user(request)
-    if not token or not user:
+    if not token or not user or not _get_active_token_device(token, user):
         _log_event(request, 'api_audit_conn_active_unauthorized', level="warning")
         return JsonResponse('', safe=False, status=401)
-    peer_id = request.GET.get('id', '')
-    session_id = request.GET.get('session_id', '')
-    try:
-        conn_type = int(request.GET.get('conn_type', 0))
-    except Exception:
-        conn_type = 0
-    if (
-        not isinstance(peer_id, str)
-        or not peer_id
-        or len(peer_id) > 20
-        or not isinstance(session_id, str)
-        or not session_id
-        or len(session_id) > 60
-    ):
+    peer_id = _audit_rid(request.GET.get('id', ''))
+    session_id = _audit_session_id(request.GET.get('session_id', ''))
+    conn_type = _audit_enum(request.GET.get('conn_type', 0), range(5))
+    if peer_id is None or session_id is None or conn_type is None:
         _log_event(request, 'api_audit_conn_active_failed', level="warning", reason='missing_id')
         return JsonResponse('', safe=False, status=400)
-    conn_exists = ConnLog.objects.filter(
-        Q(rid=peer_id) & Q(session_id=session_id) & Q(from_id=token.rid)
-    ).exists()
-    if not conn_exists and not user.is_admin:
-        # The host posts the controller identity after the initial connection
-        # record. An empty 200 keeps the client's bounded retry loop alive
-        # without exposing another user's audit GUID.
-        return JsonResponse('', safe=False)
     with transaction.atomic():
-        session, _created = AuditSession.objects.select_for_update().get_or_create(
-            peer_id=peer_id,
-            session_id=session_id,
-            defaults={'guid': uuid.uuid4().hex, 'conn_type': conn_type, 'actor': user},
+        connection_log = (
+            ConnLog.objects.select_for_update()
+            .filter(
+                rid=peer_id,
+                session_id=session_id,
+                from_id=token.device.rid,
+            )
+            .first()
         )
-        if session.actor_id and session.actor_id != user.id and not user.is_admin:
+        if not connection_log:
+            # The host posts the controller identity after the initial
+            # connection record. An empty 200 keeps the client's bounded retry
+            # loop alive without exposing another user's audit GUID.
+            return JsonResponse('', safe=False)
+        if connection_log.actor_id and connection_log.actor_id != user.id:
             return JsonResponse('', safe=False, status=403)
         update_fields = []
-        if session.actor_id is None:
-            session.actor = user
+        if connection_log.actor_id is None:
+            connection_log.actor = user
             update_fields.append('actor')
-        if conn_type and session.conn_type != conn_type:
-            session.conn_type = conn_type
+        if connection_log.conn_type is None:
+            connection_log.conn_type = conn_type
             update_fields.append('conn_type')
+        elif connection_log.conn_type != conn_type:
+            return JsonResponse('', safe=False, status=409)
         if update_fields:
-            session.save(update_fields=update_fields)
+            connection_log.save(update_fields=update_fields)
     _log_event(request, 'api_audit_conn_active', level="debug", username=user.username, peer_id=peer_id, session_id=session_id, conn_type=conn_type)
-    return JsonResponse(session.guid, safe=False)
+    return JsonResponse(str(connection_log.guid), safe=False)
 
 
 def _audit_controller_note(request, postdata):
     token, user = _get_token_user(request)
-    if not token or not user:
+    if not token or not user or not _get_active_token_device(token, user):
         return JsonResponse({'error': 'Invalid token'}, status=401)
-    peer_id = postdata.get('id')
-    raw_session_id = postdata.get('session_id')
+    peer_id = _audit_rid(postdata.get('id'))
+    session_id = _audit_session_id(postdata.get('session_id'))
     note = postdata.get('note')
-    if isinstance(raw_session_id, bool) or not isinstance(raw_session_id, (str, int)):
-        return JsonResponse({'error': 'Invalid audit note'}, status=400)
-    session_id = str(raw_session_id)
     if (
-        not isinstance(peer_id, str)
-        or not peer_id
-        or len(peer_id) > 20
-        or not session_id
-        or len(session_id) > 60
+        peer_id is None
+        or session_id is None
         or not isinstance(note, str)
         or len(note.encode()) > MAX_AUDIT_NOTE_BYTES
     ):
         return JsonResponse({'error': 'Invalid audit note'}, status=400)
-    participant = ConnLog.objects.filter(
-        Q(rid=peer_id) & Q(session_id=session_id) & Q(from_id=token.rid)
-    ).exists()
-    if not participant and not user.is_admin:
-        return JsonResponse({'error': 'Audit session not found'}, status=404)
     with transaction.atomic():
-        session = AuditSession.objects.select_for_update().filter(
-            Q(peer_id=peer_id) & Q(session_id=session_id)
-        ).first()
-        if not session:
-            return JsonResponse({'error': 'Audit session not found'}, status=404)
-        if session.actor_id and session.actor_id != user.id and not user.is_admin:
-            return JsonResponse({'error': 'Audit session not found'}, status=404)
-        session.actor = session.actor or user
-        session.note = note
-        session.save(update_fields=['actor', 'note', 'updated_at'])
-    _log_event(request, 'api_audit_note_update', username=user.username, guid=session.guid)
+        connection_log = (
+            ConnLog.objects.select_for_update()
+            .filter(
+                rid=peer_id,
+                session_id=session_id,
+                from_id=token.device.rid,
+            )
+            .first()
+        )
+        if not connection_log:
+            return JsonResponse({'error': 'Connection audit not found'}, status=404)
+        if connection_log.actor_id and connection_log.actor_id != user.id:
+            return JsonResponse({'error': 'Connection audit not found'}, status=404)
+        connection_log.actor = connection_log.actor or user
+        connection_log.note = note
+        connection_log.save(update_fields=['actor', 'note'])
+    _log_event(request, 'api_audit_note_update', username=user.username, guid=connection_log.guid)
     return JsonResponse({'code': 1, 'data': 'ok'})
 
 
@@ -2054,78 +3183,107 @@ def _audit_conn(request):
     if error:
         return error
     action = postdata.get('action', '')
-    raw_conn_id = postdata.get('conn_id', '')
-    raw_session_id = postdata.get('session_id', '')
-    if isinstance(raw_conn_id, bool) or not isinstance(raw_conn_id, (str, int)):
+    conn_id = _audit_connection_id(postdata.get('conn_id'))
+    peer_id = token.device.rid
+    session_id = _audit_session_id(postdata.get('session_id'))
+    if conn_id is None or session_id is None:
         return JsonResponse({'error': 'Invalid connection identity'}, status=400)
-    if isinstance(raw_session_id, bool) or not isinstance(raw_session_id, (str, int)):
-        return JsonResponse({'error': 'Invalid connection identity'}, status=400)
-    conn_id = _bounded_audit_text(str(raw_conn_id), 10)
-    peer_id = token.rid
-    session_id = _bounded_audit_text(str(raw_session_id), 60)
-    if conn_id is None or session_id is None or not conn_id:
-        return JsonResponse({'error': 'Invalid connection identity'}, status=400)
-    scoped_logs = ConnLog.objects.filter(Q(conn_id=conn_id) & Q(rid=token.rid) & Q(uuid=token.uuid))
+    scoped_logs = ConnLog.objects.filter(
+        conn_id=conn_id,
+        rid=token.device.rid,
+        uuid=token.device.uuid,
+        session_id=session_id,
+    )
     if action == 'new':
-        conn_type = postdata.get('type', None)
-        try:
-            conn_type = int(conn_type) if conn_type is not None else None
-        except (TypeError, ValueError):
+        raw_conn_type = postdata.get('type')
+        conn_type = (
+            None
+            if raw_conn_type is None
+            else _audit_enum(raw_conn_type, range(5))
+        )
+        if raw_conn_type is not None and conn_type is None:
             return JsonResponse({'error': 'Invalid connection type'}, status=400)
-        source_ip = _bounded_audit_text(postdata.get('ip', ''), 30)
+        source_ip = _audit_ip(postdata.get('ip'))
         if source_ip is None:
             return JsonResponse({'error': 'Invalid source IP'}, status=400)
-        if scoped_logs.exists():
-            return JsonResponse({'error': 'Connection already exists'}, status=409)
-        ConnLog.objects.create(
-            action=action,
-            conn_id=conn_id,
-            from_ip=source_ip,
-            from_id='',
-            rid=peer_id,
-            conn_start=timezone.now(),
-            session_id=session_id,
-            uuid=token.uuid,
-            conn_type=conn_type if conn_type is not None else None,
-        )
-        if peer_id and session_id:
-            AuditSession.objects.get_or_create(
-                peer_id=peer_id,
-                session_id=session_id,
-                defaults={'guid': uuid.uuid4().hex, 'conn_type': conn_type or 0},
-            )
+        audit_ref = _bounded_audit_text(postdata.get('conn_audit_ref', ''), 256)
+        if audit_ref is None:
+            return JsonResponse({'error': 'Invalid audit reference'}, status=400)
+        try:
+            with transaction.atomic():
+                connection_log, created = ConnLog.objects.get_or_create(
+                    rid=peer_id,
+                    session_id=session_id,
+                    uuid=token.device.uuid,
+                    defaults={
+                        'conn_id': conn_id,
+                        'from_ip': source_ip,
+                        'from_id': '',
+                        'conn_type': conn_type,
+                        'audit_ref': audit_ref,
+                        'reporter': user,
+                    },
+                )
+                if not created and (
+                    connection_log.conn_id != conn_id
+                    or connection_log.from_ip != source_ip
+                    or connection_log.reporter_id != user.id
+                ):
+                    return JsonResponse(
+                        {'error': 'Connection session conflict'},
+                        status=409,
+                    )
+        except IntegrityError:
+            return JsonResponse({'error': 'Connection session conflict'}, status=409)
         _log_event(request, 'api_audit_conn_new', level="info", username=user.username, conn_id=conn_id, peer_id=peer_id, session_id=session_id, conn_type=conn_type)
     elif action == 'close':
-        if scoped_logs.update(conn_end=timezone.now()) != 1:
-            return JsonResponse({'error': 'Connection not found'}, status=404)
+        with transaction.atomic():
+            connection_log = scoped_logs.select_for_update().first()
+            if not connection_log:
+                return JsonResponse({'error': 'Connection not found'}, status=404)
+            if connection_log.conn_end is None:
+                connection_log.conn_end = timezone.now()
+                connection_log.save(update_fields=['conn_end'])
         _log_event(request, 'api_audit_conn_close', level="info", username=user.username, conn_id=conn_id, peer_id=peer_id, session_id=session_id)
     else:
         if action not in ('', 'update'):
             return JsonResponse({'error': 'Invalid action'}, status=400)
         updates = {}
-        if session_id:
-            updates['session_id'] = session_id
         if 'peer' in postdata:
             peer = postdata.get('peer', [])
-            if isinstance(peer, (list, tuple)) and peer:
-                from_id = _bounded_audit_text(str(peer[0]), 20)
-                if from_id is None:
-                    return JsonResponse({'error': 'Invalid peer identity'}, status=400)
-                updates['from_id'] = from_id
-            else:
+            if not isinstance(peer, (list, tuple)) or len(peer) != 2:
                 return JsonResponse({'error': 'Invalid peer identity'}, status=400)
+            from_id = _audit_rid(peer[0])
+            if from_id is None:
+                return JsonResponse({'error': 'Invalid peer identity'}, status=400)
+            updates['from_id'] = from_id
         if 'type' in postdata:
-            try:
-                update_type = int(postdata.get('type'))
-            except (TypeError, ValueError):
+            update_type = _audit_enum(postdata.get('type'), range(5))
+            if update_type is None:
                 return JsonResponse({'error': 'Invalid connection type'}, status=400)
             updates['conn_type'] = update_type
+        if 'primary_auth' in postdata:
+            primary_auth = _audit_enum(postdata.get('primary_auth'), range(1, 5))
+            if primary_auth is None:
+                return JsonResponse({'error': 'Invalid primary authentication'}, status=400)
+            updates['primary_auth'] = primary_auth
+        if 'two_factor' in postdata:
+            two_factor = _audit_enum(postdata.get('two_factor'), range(1, 3))
+            if two_factor is None:
+                return JsonResponse({'error': 'Invalid second factor'}, status=400)
+            updates['two_factor'] = two_factor
+        if 'conn_audit_ref' in postdata:
+            audit_ref = _bounded_audit_text(postdata.get('conn_audit_ref'), 256)
+            if audit_ref is None:
+                return JsonResponse({'error': 'Invalid audit reference'}, status=400)
+            updates['audit_ref'] = audit_ref
         if 'note' in postdata:
             note = _bounded_audit_text(postdata.get('note'), MAX_AUDIT_NOTE_BYTES)
             if note is None:
                 return JsonResponse({'error': 'Invalid audit note'}, status=400)
-            AuditSession.objects.filter(Q(peer_id=peer_id) & Q(session_id=session_id)).update(note=note)
-        if updates and scoped_logs.update(**updates) != 1:
+            updates['note'] = note
+        updated = scoped_logs.update(**updates) if updates else int(scoped_logs.exists())
+        if updated != 1:
             return JsonResponse({'error': 'Connection not found'}, status=404)
         _log_event(request, 'api_audit_conn_update', level="debug", username=user.username, conn_id=conn_id, peer_id=peer_id, session_id=session_id)
     return JsonResponse({'code': 1, 'data': 'ok'})
@@ -2166,25 +3324,33 @@ def _audit_file(request):
                 return JsonResponse({'error': 'Invalid audit files'}, status=400)
             total_size += size
     path = _bounded_audit_text(postdata.get('path', ''), 500)
-    user_ip = _bounded_audit_text(info_obj.get('ip', ''), 20)
-    remote_id = _bounded_audit_text(str(postdata.get('peer_id', '')), 20)
-    try:
-        direction = int(postdata.get('type', 0))
-    except (TypeError, ValueError):
-        return JsonResponse({'error': 'Invalid audit direction'}, status=400)
-    if path is None or user_ip is None or remote_id is None or not -16 <= direction <= 16:
+    user_ip = _audit_ip(info_obj.get('ip', ''))
+    remote_id = _audit_rid(postdata.get('peer_id', ''))
+    direction = _audit_enum(postdata.get('type', 0), (0, 1))
+    if path is None or user_ip is None or remote_id is None or direction is None:
         return JsonResponse({'error': 'Invalid file audit'}, status=400)
-    filesize = convert_filesize(total_size) if total_size else ''
     FileLog.objects.create(
         file=path,
         user_id=remote_id,
         user_ip=user_ip,
-        remote_id=token.rid,
-        filesize=filesize,
+        remote_id=token.device.rid,
+        filesize=total_size,
         direction=direction,
         logged_at=timezone.now(),
+        details=info_obj,
+        reporter=user,
+        reporter_device_uuid=token.device.uuid,
     )
-    _log_event(request, 'api_audit_file', level="info", username=user.username, peer_id=remote_id, remote_id=token.rid, direction=direction, filesize=filesize)
+    _log_event(
+        request,
+        'api_audit_file',
+        level="info",
+        username=user.username,
+        peer_id=remote_id,
+        remote_id=token.device.rid,
+        direction=direction,
+        filesize=total_size,
+    )
     return JsonResponse({'code': 1, 'data': 'ok'})
 
 
@@ -2193,19 +3359,42 @@ def _audit_alarm(request):
     if not isinstance(postdata, dict):
         _log_event(request, 'api_audit_alarm_invalid_payload', level="warning")
         return JsonResponse({'error': 'Invalid payload'}, status=400)
-    _token, user, error = _audit_device_context(request, postdata)
+    token, user, error = _audit_device_context(request, postdata)
     if error:
         return error
-    try:
-        typ = int(postdata.get('typ', 0))
-    except (TypeError, ValueError):
+    typ = _audit_enum(postdata.get('typ', 0), AlarmLog.TYPES)
+    if typ is None:
         return JsonResponse({'error': 'Invalid alarm type'}, status=400)
-    info = _bounded_audit_text(postdata.get('info', ''), MAX_AUDIT_INFO_BYTES)
-    if info is None or not -128 <= typ <= 128:
-        return JsonResponse({'error': 'Invalid alarm'}, status=400)
+    raw_info = postdata.get('info', '{}')
+    if not isinstance(raw_info, (str, dict)):
+        return JsonResponse({'error': 'Invalid alarm information'}, status=400)
+    if isinstance(raw_info, str) and len(raw_info.encode()) > MAX_AUDIT_INFO_BYTES:
+        return JsonResponse({'error': 'Alarm information is too large'}, status=413)
+    try:
+        info = json.loads(raw_info) if isinstance(raw_info, str) else raw_info
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return JsonResponse({'error': 'Invalid alarm information'}, status=400)
+    if not isinstance(info, dict):
+        return JsonResponse({'error': 'Invalid alarm information'}, status=400)
+    conn_id_value = postdata.get('conn_id')
+    conn_id = (
+        None
+        if conn_id_value is None
+        else _audit_connection_id(conn_id_value)
+    )
+    if conn_id_value is not None and conn_id is None:
+        return JsonResponse({'error': 'Invalid connection identity'}, status=400)
+    audit_ref = _bounded_audit_text(postdata.get('conn_audit_ref', ''), 256)
+    if audit_ref is None:
+        return JsonResponse({'error': 'Invalid audit reference'}, status=400)
     AlarmLog.objects.create(
         typ=typ,
         info=info,
+        reporter=user,
+        reporter_device_id=token.device.rid,
+        reporter_device_uuid=token.device.uuid,
+        conn_id=conn_id,
+        audit_ref=audit_ref,
     )
     _log_event(request, 'api_audit_alarm', level="warning", username=user.username, typ=typ)
     return JsonResponse({'code': 1, 'data': 'ok'})
@@ -2213,16 +3402,6 @@ def _audit_alarm(request):
 
 def audit(request):
     return _audit_conn(request)
-
-
-def convert_filesize(size_bytes):
-    if size_bytes == 0:
-        return "0B"
-    size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
-    i = int(math.floor(math.log(size_bytes, 1024)))
-    p = math.pow(1024, i)
-    s = round(size_bytes / p, 2)
-    return "%s %s" % (s, size_name[i])
 
 
 def _pagination(request, default=100):
@@ -2257,17 +3436,6 @@ def _filter_text(qs, field, value):
     return qs.filter(**{field: value})
 
 
-def _json_text(value):
-    if value in (None, ''):
-        return []
-    if isinstance(value, (list, dict)):
-        return value
-    try:
-        return json.loads(value)
-    except Exception:
-        return []
-
-
 def _require_admin(request, event):
     token, user = _get_token_user(request)
     if not user:
@@ -2287,7 +3455,21 @@ def _user_guid(user):
     return str(user.pk)
 
 
+def _user_group_names(user):
+    cached_groups = getattr(
+        user,
+        '_prefetched_objects_cache',
+        {},
+    ).get('groups')
+    if cached_groups is None:
+        return list(
+            user.groups.order_by('name').values_list('name', flat=True)
+        )
+    return sorted(group.name for group in cached_groups)
+
+
 def _serialize_user(u):
+    group_names = _user_group_names(u)
     return {
         'guid': _user_guid(u),
         'name': u.username,
@@ -2296,15 +3478,26 @@ def _serialize_user(u):
         'is_admin': True if u.is_admin else False,
         'email': u.email or '',
         'note': u.note or '',
-        'group_name': u.group_name or '',
-        'strategy_name': u.strategy_name or '',
-        'tfa_enforced': bool(u.tfa_enforced),
-        'login_verification_disabled': bool(u.login_verification_disabled),
+        'group_name': group_names[0] if group_names else '',
+        'group_names': group_names,
+        'strategy_name': u.strategy.name if u.strategy_id else '',
     }
 
 
 def _serialize_device(device):
-    owner_name = device.owner.username if device.owner else device.owner_name
+    owner_name = device.owner.username if device.owner else ''
+    owner_group_names = (
+        _user_group_names(device.owner)
+        if device.owner
+        else []
+    )
+    effective_strategy = device.effective_strategy()
+    deployed = bool(
+        device.public_key_hash
+        and device.owner
+        and device.owner.is_active
+        and device.is_active
+    )
     return {
         'guid': _device_guid(device),
         'id': device.rid,
@@ -2312,16 +3505,31 @@ def _serialize_device(device):
         'device_name': device.hostname,
         'device_username': device.username,
         'user_name': owner_name or '',
-        'group_name': device.owner.group_name if device.owner else '',
-        'device_group_name': device.device_group_name or '',
-        'strategy_name': device.strategy_name or '',
+        'group_name': owner_group_names[0] if owner_group_names else '',
+        'group_names': owner_group_names,
+        'device_group_name': (
+            device.device_group.name
+            if device.device_group_id
+            else ''
+        ),
+        'strategy_name': (
+            effective_strategy.name
+            if effective_strategy
+            else ''
+        ),
         'status': 1 if device.is_active else 0,
         'online': _is_online(device.update_time),
         'last_online': device.update_time.isoformat() if device.update_time else '',
         'platform': device.os,
         'version': device.version,
-        'ip_address': device.ip_address,
+        'ip_address': device.ip_address or '',
         'note': device.note or '',
+        'is_deployed': deployed,
+        'deployment_status': (
+            'disabled'
+            if not device.is_active
+            else ('verified' if deployed else 'pending')
+        ),
     }
 
 
@@ -2330,18 +3538,23 @@ def _serialize_device_group(group):
         'guid': str(group.guid),
         'name': group.name,
         'note': group.note or '',
-        'allowed_incomings': _json_text(group.allowed_incomings),
-        'strategy_name': group.strategy_name or '',
+        'allowed_incomings': (
+            group.allowed_incomings
+            if isinstance(group.allowed_incomings, list)
+            else []
+        ),
+        'strategy_name': group.strategy.name if group.strategy_id else '',
     }
 
 
 def _serialize_strategy(strategy):
+    options = _strategy_options_value(strategy.config_options)
     return {
         'guid': str(strategy.guid),
         'name': strategy.name,
         'enabled': bool(strategy.enabled),
         'status': 1 if strategy.enabled else 0,
-        'config_options': _json_text(strategy.config_options) if strategy.config_options else {},
+        'config_options': options if options is not None else {},
         'updated_at': strategy.updated_at.isoformat() if strategy.updated_at else '',
     }
 
@@ -2350,35 +3563,75 @@ def _is_online(updated_at):
     return (timezone.now() - updated_at).total_seconds() <= 120 if updated_at else False
 
 
-def _coerce_bool(value, default=False):
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in ('1', 'true', 'yes', 'on')
-    if value is None:
-        return default
-    return bool(value)
-
-
 def users(request):
     if request.method == 'POST':
         admin_user, error = _require_admin(request, 'api_users_create')
         if error:
             return error
         data = _load_json(request)
-        username = str(data.get('name') or data.get('username') or '').strip()
-        password = str(data.get('password') or '').strip()
-        if not username or not password:
-            return JsonResponse({'error': 'name and password are required'}, status=400)
-        if UserProfile.objects.filter(username=username).exists():
-            return JsonResponse({'error': 'User already exists'}, status=409)
-        user = UserProfile.objects.create_user(
-            username=username,
-            password=password,
-            email=str(data.get('email') or ''),
-            note=str(data.get('note') or ''),
-            group_name=str(data.get('group_name') or ''),
+        if not isinstance(data, dict):
+            return JsonResponse({'error': 'Invalid user payload'}, status=400)
+        username = _model_text_value(
+            data.get('name') or data.get('username'),
+            UserProfile,
+            'username',
+            allow_empty=False,
         )
+        password = data.get('password')
+        email = _email_value(data.get('email', ''))
+        note = _model_text_value(
+            data.get('note', ''),
+            UserProfile,
+            'note',
+            max_bytes=4096,
+            strip=False,
+        )
+        group_name = _model_text_value(
+            data.get('group_name', ''),
+            Group,
+            'name',
+        )
+        if (
+            username is None
+            or len(username) < 3
+            or not isinstance(password, str)
+            or not password
+            or len(password) > settings.MAX_PASSWORD_LENGTH
+            or email is None
+            or note is None
+            or group_name is None
+        ):
+            return JsonResponse({'error': 'Invalid user payload'}, status=400)
+        if UserProfile.objects.filter(username__iexact=username).exists():
+            return JsonResponse({'error': 'User already exists'}, status=409)
+        candidate = UserProfile(
+            username=username,
+            email=email,
+            note=note,
+        )
+        try:
+            candidate.set_password(password)
+            candidate.full_clean()
+            password_validation.validate_password(password, user=candidate)
+        except ValidationError:
+            return JsonResponse({'error': 'Password does not meet security requirements'}, status=400)
+        try:
+            with transaction.atomic():
+                user = UserProfile.objects.create_user(
+                    username=username,
+                    password=password,
+                    email=email,
+                    note=note,
+                )
+                if group_name:
+                    group = Group.objects.filter(
+                        name__iexact=group_name,
+                    ).first()
+                    if not group:
+                        group = Group.objects.create(name=group_name)
+                    user.groups.add(group)
+        except IntegrityError:
+            return JsonResponse({'error': 'User already exists'}, status=409)
         _log_event(request, 'api_users_created', username=admin_user.username, target=username)
         return JsonResponse(_serialize_user(user))
     if request.method != 'GET':
@@ -2388,46 +3641,27 @@ def users(request):
     if not user:
         _log_event(request, 'api_users_unauthorized', level="warning")
         return JsonResponse({'error': 'Invalid token'}, status=401)
-    qs = UserProfile.objects.all().order_by('id')
+    qs = (
+        UserProfile.objects.select_related('strategy')
+        .prefetch_related('groups')
+        .order_by('id')
+    )
     if not user.is_admin:
         qs = qs.filter(Q(id=user.id))
     qs = _filter_text(qs, 'username', request.GET.get('name'))
-    qs = _filter_text(qs, 'group_name', request.GET.get('group_name'))
+    qs = _filter_text(qs, 'groups__name', request.GET.get('group_name'))
     status = request.GET.get('status', '')
     if status == '1':
         qs = qs.filter(Q(is_active=True))
     elif status == '0':
         qs = qs.filter(Q(is_active=False))
     _log_event(request, 'api_users', level="debug", username=user.username, total=qs.count())
-    return _paged_response(request, qs, _serialize_user)
-
-
-def users_invite(request):
-    if request.method != 'POST':
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')}, status=405)
-    admin_user, error = _require_admin(request, 'api_users_invite')
-    if error:
-        return error
-    data = _load_json(request)
-    username = str(data.get('name') or data.get('email') or '').strip()
-    email = str(data.get('email') or '').strip()
-    if not username or not email:
-        return JsonResponse({'error': 'name and email are required'}, status=400)
-    user, created = UserProfile.objects.get_or_create(username=username, defaults={
-        'email': email,
-        'note': str(data.get('note') or ''),
-        'group_name': str(data.get('group_name') or ''),
-        'is_active': True,
-    })
-    if created:
-        user.set_unusable_password()
-        user.save()
-    _log_event(request, 'api_users_invited', username=admin_user.username, target=username)
-    return JsonResponse(_serialize_user(user))
+    return _paged_response(request, qs.distinct(), _serialize_user)
 
 
 def _user_by_guid(guid):
-    return UserProfile.objects.filter(pk=guid).first()
+    pk = _numeric_pk(guid)
+    return UserProfile.objects.filter(pk=pk).first() if pk is not None else None
 
 
 def user_status(request, guid, action):
@@ -2439,10 +3673,12 @@ def user_status(request, guid, action):
     target = _user_by_guid(guid)
     if not target:
         return JsonResponse({'error': 'User not found'}, status=404)
+    if target.id == admin_user.id and action == 'disable':
+        return JsonResponse({'error': 'Cannot disable current user'}, status=400)
     target.is_active = action == 'enable'
     target.save(update_fields=['is_active'])
     if not target.is_active:
-        RustDeskToken.objects.filter(uid=str(target.id)).delete()
+        RustDeskToken.objects.filter(device__owner=target).delete()
     _log_event(request, f'api_user_{action}', username=admin_user.username, target=target.username)
     return JsonResponse(_serialize_user(target))
 
@@ -2453,43 +3689,28 @@ def user_delete(request, guid):
     admin_user, error = _require_admin(request, 'api_user_delete')
     if error:
         return error
-    target = _user_by_guid(guid)
-    if not target:
-        return JsonResponse({'error': 'User not found'}, status=404)
-    if target.id == admin_user.id:
-        return JsonResponse({'error': 'Cannot delete current user'}, status=400)
-    username = target.username
-    RustDeskToken.objects.filter(uid=str(target.id)).delete()
-    target.delete()
+    with transaction.atomic():
+        target_pk = _numeric_pk(guid)
+        target = (
+            UserProfile.objects.select_for_update().filter(pk=target_pk).first()
+            if target_pk is not None
+            else None
+        )
+        if not target:
+            return JsonResponse({'error': 'User not found'}, status=404)
+        if target.id == admin_user.id:
+            return JsonResponse({'error': 'Cannot delete current user'}, status=400)
+        username = target.username
+        RustDeskToken.objects.filter(device__owner=target).delete()
+        RustDeskDevice.objects.filter(owner=target).update(
+            owner=None,
+            public_key_hash=None,
+            is_active=False,
+            update_time=timezone.now(),
+        )
+        target.delete()
     _log_event(request, 'api_user_deleted', username=admin_user.username, target=username)
     return JsonResponse({'result': 'OK'})
-
-
-def users_tfa_enforce(request):
-    if request.method != 'PUT':
-        return JsonResponse({'error': 'PUT required'}, status=405)
-    admin_user, error = _require_admin(request, 'api_users_tfa_enforce')
-    if error:
-        return error
-    data = _load_json(request)
-    guids = data.get('user_guids') or []
-    enforce = bool(data.get('enforce'))
-    updated = UserProfile.objects.filter(pk__in=guids).update(tfa_enforced=enforce)
-    _log_event(request, 'api_users_tfa_enforce', username=admin_user.username, updated=updated, enforce=enforce)
-    return JsonResponse({'result': 'OK', 'updated': updated})
-
-
-def users_disable_login_verification(request):
-    if request.method != 'PUT':
-        return JsonResponse({'error': 'PUT required'}, status=405)
-    admin_user, error = _require_admin(request, 'api_users_disable_login_verification')
-    if error:
-        return error
-    data = _load_json(request)
-    guids = data.get('user_guids') or []
-    updated = UserProfile.objects.filter(pk__in=guids).update(login_verification_disabled=True)
-    _log_event(request, 'api_users_disable_login_verification', username=admin_user.username, updated=updated, typ=data.get('type'))
-    return JsonResponse({'result': 'OK', 'updated': updated})
 
 
 def users_force_logout(request):
@@ -2499,8 +3720,14 @@ def users_force_logout(request):
     if error:
         return error
     data = _load_json(request)
-    guids = [str(x) for x in (data.get('user_guids') or [])]
-    deleted = RustDeskToken.objects.filter(uid__in=guids).delete()[0]
+    if not isinstance(data, dict):
+        return JsonResponse({'error': 'Invalid user list'}, status=400)
+    guids = _identifier_list(data.get('user_guids'), numeric=True)
+    if guids is None:
+        return JsonResponse({'error': 'Invalid user list'}, status=400)
+    deleted = RustDeskToken.objects.filter(
+        device__owner_id__in=guids,
+    ).delete()[0]
     _log_event(request, 'api_users_force_logout', username=admin_user.username, deleted=deleted)
     return JsonResponse({'result': 'OK', 'deleted': deleted})
 
@@ -2512,24 +3739,48 @@ def devices(request):
     if not user:
         _log_event(request, 'api_devices_unauthorized', level="warning")
         return JsonResponse({'error': 'Invalid token'}, status=401)
-    qs = RustDesDevice.objects.select_related('owner').all().order_by('rid')
+    qs = RustDeskDevice.objects.select_related(
+        'owner__strategy',
+        'device_group__strategy',
+        'strategy',
+    ).prefetch_related('owner__groups').order_by('rid')
     if not user.is_admin:
         qs = qs.filter(Q(owner=user))
     qs = _filter_text(qs, 'rid', request.GET.get('id'))
     qs = _filter_text(qs, 'hostname', request.GET.get('device_name'))
     qs = _filter_text(qs, 'username', request.GET.get('device_username'))
-    qs = _filter_text(qs, 'device_group_name', request.GET.get('device_group_name'))
+    qs = _filter_text(
+        qs,
+        'device_group__name',
+        request.GET.get('device_group_name'),
+    )
     user_name = request.GET.get('user_name')
     if user_name:
-        qs = _filter_text(qs, 'owner_name', user_name)
+        qs = _filter_text(qs, 'owner__username', user_name)
     group_name = request.GET.get('group_name')
     if group_name:
-        qs = qs.filter(owner__group_name=group_name.replace('%', '') if '%' in group_name else group_name)
+        lookup = (
+            'owner__groups__name__icontains'
+            if '%' in group_name
+            else 'owner__groups__name'
+        )
+        qs = qs.filter(
+            **{lookup: group_name.replace('%', '')}
+        ).distinct()
     return _paged_response(request, qs, _serialize_device)
 
 
 def _device_by_guid(guid):
-    return RustDesDevice.objects.filter(pk=guid).first()
+    pk = _numeric_pk(guid)
+    return (
+        RustDeskDevice.objects.select_related(
+            'owner__strategy',
+            'device_group__strategy',
+            'strategy',
+        ).filter(pk=pk).first()
+        if pk is not None
+        else None
+    )
 
 
 def device_status(request, guid, action):
@@ -2542,7 +3793,9 @@ def device_status(request, guid, action):
     if not device:
         return JsonResponse({'error': 'Device not found'}, status=404)
     device.is_active = action == 'enable'
-    device.save(update_fields=['is_active'])
+    device.save(update_fields=['is_active', 'update_time'])
+    if not device.is_active:
+        _revoke_device_tokens(device)
     _log_event(request, f'api_device_{action}', username=admin_user.username, rid=device.rid)
     return JsonResponse(_serialize_device(device))
 
@@ -2557,6 +3810,7 @@ def device_delete(request, guid):
     if not device:
         return JsonResponse({'error': 'Device not found'}, status=404)
     rid = device.rid
+    _revoke_device_tokens(device)
     device.delete()
     _log_event(request, 'api_device_deleted', username=admin_user.username, rid=rid)
     return JsonResponse({'result': 'OK'})
@@ -2568,42 +3822,107 @@ def device_assign(request, guid):
     admin_user, error = _require_admin(request, 'api_device_assign')
     if error:
         return error
-    device = _device_by_guid(guid)
-    if not device:
-        return JsonResponse({'error': 'Device not found'}, status=404)
     data = _load_json(request)
+    if not isinstance(data, dict):
+        return JsonResponse({'error': 'Invalid assignment'}, status=400)
     typ = str(data.get('type') or '')
-    value = str(data.get('value') or '')
-    if typ == 'user_name':
-        owner = UserProfile.objects.filter(username=value).first()
-        if not owner:
-            return JsonResponse({'error': 'User not found'}, status=404)
-        device.owner = owner
-        device.owner_name = owner.username
-    elif typ == 'device_group_name':
-        if not value:
-            device.device_group_name = ''
+    value = data.get('value')
+    owner_changed = False
+    device_pk = _numeric_pk(guid)
+    with transaction.atomic():
+        device = (
+            RustDeskDevice.objects.select_for_update()
+            .select_related('owner')
+            .filter(pk=device_pk)
+            .first()
+            if device_pk is not None
+            else None
+        )
+        if not device:
+            return JsonResponse({'error': 'Device not found'}, status=404)
+        if typ == 'user_name':
+            owner = _user_by_identifier(value, active_only=True)
+            if not owner:
+                return JsonResponse({'error': 'Active user not found'}, status=404)
+            owner_changed = device.owner_id != owner.id
+            device.owner = owner
+        elif typ == 'device_group_name':
+            group_name = _bounded_text_value(value, 480)
+            if group_name is not None:
+                group_name = group_name.strip()
+            if group_name is None:
+                return JsonResponse({'error': 'Invalid device group'}, status=400)
+            group = (
+                DeviceGroup.objects.filter(name=group_name).first()
+                if group_name
+                else None
+            )
+            if group_name and not group:
+                return JsonResponse({'error': 'Device group not found'}, status=404)
+            device.device_group = group
+        elif typ == 'strategy_name':
+            strategy_name = _bounded_text_value(value, 240)
+            if strategy_name is not None:
+                strategy_name = strategy_name.strip()
+            if strategy_name is None:
+                return JsonResponse({'error': 'Invalid strategy'}, status=400)
+            strategy = (
+                StrategyProfile.objects.filter(name=strategy_name).first()
+                if strategy_name
+                else None
+            )
+            if strategy_name and not strategy:
+                return JsonResponse({'error': 'Strategy not found'}, status=404)
+            device.strategy = strategy
+        elif typ in ('note', 'device_username', 'device_name'):
+            field_name = {
+                'note': 'note',
+                'device_username': 'username',
+                'device_name': 'hostname',
+            }[typ]
+            text_value = _model_text_value(
+                value,
+                RustDeskDevice,
+                field_name,
+                strip=False,
+                max_bytes=4096 if field_name == 'note' else None,
+            )
+            if text_value is None:
+                return JsonResponse({'error': 'Invalid assignment value'}, status=400)
+            setattr(device, field_name, text_value)
+        elif typ == 'ab':
+            if not isinstance(value, dict):
+                return JsonResponse(
+                    {'error': 'Address-book assignment must be an object'},
+                    status=400,
+                )
+            ab_updates = _validated_device_update_fields(
+                value,
+                DEVICE_ADDRESS_BOOK_FIELDS,
+            )
+            allowed_fields = {
+                'address_book_name',
+                'address_book_tag',
+                'address_book_alias',
+                'address_book_password',
+                'address_book_note',
+            }
+            if (
+                ab_updates is None
+                or not ab_updates
+                or any(field not in allowed_fields for field in ab_updates)
+            ):
+                return JsonResponse(
+                    {'error': 'Invalid address-book assignment'},
+                    status=400,
+                )
+            for field, field_value in ab_updates.items():
+                setattr(device, field, field_value)
         else:
-            DeviceGroup.objects.get_or_create(name=value)
-            device.device_group_name = value
-    elif typ == 'strategy_name':
-        device.strategy_name = value
-    elif typ == 'note':
-        device.note = value
-    elif typ == 'device_username':
-        device.username = value
-    elif typ == 'device_name':
-        device.hostname = value
-    elif typ == 'ab':
-        parts = value.split(',')
-        device.address_book_name = parts[0] if len(parts) > 0 else ''
-        device.address_book_tag = parts[1] if len(parts) > 1 else ''
-        device.address_book_alias = parts[2] if len(parts) > 2 else ''
-        device.address_book_password = parts[3] if len(parts) > 3 else ''
-        device.address_book_note = parts[4] if len(parts) > 4 else ''
-    else:
-        return JsonResponse({'error': 'Invalid assign type'}, status=400)
-    device.save()
+            return JsonResponse({'error': 'Invalid assign type'}, status=400)
+        device.save()
+    if owner_changed:
+        _revoke_device_tokens(device)
     _log_event(request, 'api_device_assigned', username=admin_user.username, rid=device.rid, typ=typ)
     return JsonResponse(_serialize_device(device))
 
@@ -2618,22 +3937,51 @@ def peers(request):
         return JsonResponse({'error': 'Invalid token'}, status=401)
     current, page_size, _start, _end = _pagination(request)
     if user.is_admin:
-        device_qs = RustDesDevice.objects.all().select_related('owner').order_by('rid')
-        peer_qs = RustDeskPeer.objects.all()
+        device_qs = RustDeskDevice.objects.select_related(
+            'owner__strategy',
+            'device_group__strategy',
+            'strategy',
+        ).order_by('rid')
+        peer_qs = RustDeskPeer.objects.filter(
+            profile__guid__startswith='personal-',
+        ).select_related('profile__owner')
     else:
-        peer_qs = RustDeskPeer.objects.filter(Q(uid=user.id))
-        peer_ids = [x.rid for x in peer_qs]
-        device_qs = RustDesDevice.objects.filter(Q(owner=user) | Q(rid__in=peer_ids)).select_related('owner')
+        peer_qs = RustDeskPeer.objects.filter(
+            profile__owner=user,
+            profile__guid=_personal_guid(user),
+        ).select_related('profile__owner')
+        device_qs = RustDeskDevice.objects.filter(
+            owner=user,
+        ).select_related(
+            'owner__strategy',
+            'device_group__strategy',
+            'strategy',
+        )
         device_qs = device_qs.order_by('rid')
     devices = {x.rid: x for x in device_qs}
-    peers_by_rid = {x.rid: x for x in peer_qs}
+    if user.is_admin:
+        peers_by_owner_and_rid = {
+            (peer.profile.owner_id, peer.rid): peer
+            for peer in peer_qs
+        }
+        peers_by_rid = {
+            rid: peers_by_owner_and_rid.get((device.owner_id, rid))
+            for rid, device in devices.items()
+        }
+        device_ids = sorted(devices)
+    else:
+        peers_by_rid = {peer.rid: peer for peer in peer_qs}
+        device_ids = sorted(set(devices) | set(peers_by_rid))
     status_filter = request.GET.get('status', '')
-    device_ids = list(devices.keys())
     if status_filter in ('0', '1'):
         target = 1 if status_filter == '1' else 0
         device_ids = [
             rid for rid in device_ids
-            if (devices.get(rid) and _is_online(devices[rid].update_time)) == (target == 1)
+            if (
+                devices[rid].is_active
+                if rid in devices
+                else True
+            ) == (target == 1)
         ]
     total = len(device_ids)
     start = (current - 1) * page_size
@@ -2646,27 +3994,33 @@ def peers(request):
         owner = ''
         if device and device.owner:
             owner = device.owner.username
-        elif device and device.owner_name:
-            owner = device.owner_name
         elif peer:
-            u = UserProfile.objects.filter(Q(id=peer.uid)).first()
-            if u:
-                owner = u.username
-        status = 0
-        if device and _is_online(device.update_time):
-            status = 1
+            owner = peer.profile.owner.username
+        status = 1 if not device or device.is_active else 0
         data.append({
             'id': rid,
             'info': {
                 'username': username,
-                'os': device.os if device else '',
-                'device_name': device.hostname if device else '',
+                'os': (
+                    device.os
+                    if device
+                    else (peer.platform if peer else '')
+                ),
+                'device_name': (
+                    device.hostname
+                    if device
+                    else (peer.hostname if peer else '')
+                ),
             },
             'status': status,
             'user': owner,
             'user_name': owner,
-            'device_group_name': device.device_group_name if device else '',
-            'note': device.note if device else '',
+            'device_group_name': (
+                device.device_group.name
+                if device and device.device_group_id
+                else (peer.device_group_name if peer else '')
+            ),
+            'note': device.note if device else (peer.note if peer else ''),
         })
     _log_event(request, 'api_peers', level="debug", username=user.username, total=total, page=current, page_size=page_size)
     return JsonResponse({'total': total, 'data': data})
@@ -2681,12 +4035,20 @@ def device_group_accessible(request):
         _log_event(request, 'api_device_group_accessible_unauthorized', level="warning")
         return JsonResponse({'error': 'Invalid token'}, status=401)
     if user.is_admin:
-        groups = list(DeviceGroup.objects.all().order_by('name'))
+        groups = list(
+            DeviceGroup.objects.select_related('strategy').order_by('name')
+        )
     else:
-        peer_ids = list(RustDeskPeer.objects.filter(Q(uid=user.id)).values_list('rid', flat=True))
-        device_qs = RustDesDevice.objects.filter(Q(owner=user) | Q(rid__in=peer_ids))
-        names = sorted({d.device_group_name for d in device_qs if d.device_group_name})
-        groups = [DeviceGroup.objects.filter(name=name).first() or DeviceGroup(name=name) for name in names]
+        groups = list(
+            DeviceGroup.objects.filter(
+                devices__in=RustDeskDevice.objects.filter(
+                    owner=user,
+                )
+            )
+            .select_related('strategy')
+            .distinct()
+            .order_by('name')
+        )
     data = [_serialize_device_group(group) for group in groups]
     _log_event(request, 'api_device_group_accessible', level="debug", username=user.username, total=len(data))
     return JsonResponse({'total': len(data), 'data': data})
@@ -2698,24 +4060,64 @@ def device_groups(request):
         if error:
             return error
         data = _load_json(request)
-        name = str(data.get('name') or '').strip()
-        if not name:
-            return JsonResponse({'error': 'name is required'}, status=400)
-        group, created = DeviceGroup.objects.get_or_create(name=name)
-        group.note = str(data.get('note') or group.note or '')
-        if 'allowed_incomings' in data:
-            group.allowed_incomings = json.dumps(data.get('allowed_incomings') or [], ensure_ascii=False)
-        if 'strategy_name' in data:
-            group.strategy_name = str(data.get('strategy_name') or '')
-        group.save()
-        _log_event(request, 'api_device_groups_created', username=admin_user.username, target=name, created=created)
+        if not isinstance(data, dict):
+            return JsonResponse({'error': 'Invalid device group'}, status=400)
+        name = _model_text_value(
+            data.get('name'),
+            DeviceGroup,
+            'name',
+            allow_empty=False,
+        )
+        note = _model_text_value(
+            data.get('note', ''),
+            DeviceGroup,
+            'note',
+            strip=False,
+            max_bytes=4096,
+        )
+        allowed_incomings = _allowed_incomings_value(
+            data.get('allowed_incomings', [])
+        )
+        strategy_name = _bounded_text_value(
+            data.get('strategy_name', ''),
+            240,
+        )
+        if strategy_name is not None:
+            strategy_name = strategy_name.strip()
+        if (
+            name is None
+            or note is None
+            or allowed_incomings is None
+            or strategy_name is None
+        ):
+            return JsonResponse({'error': 'Invalid device group'}, status=400)
+        strategy = (
+            StrategyProfile.objects.filter(name=strategy_name).first()
+            if strategy_name
+            else None
+        )
+        if strategy_name and not strategy:
+            return JsonResponse({'error': 'Strategy not found'}, status=404)
+        try:
+            group = DeviceGroup.objects.create(
+                name=name,
+                note=note,
+                allowed_incomings=allowed_incomings,
+                strategy=strategy,
+            )
+        except IntegrityError:
+            return JsonResponse(
+                {'error': 'Device group already exists'},
+                status=409,
+            )
+        _log_event(request, 'api_device_groups_created', username=admin_user.username, target=name)
         return JsonResponse(_serialize_device_group(group))
     if request.method != 'GET':
         return JsonResponse({'error': _('错误的提交方式！')}, status=405)
     admin_user, error = _require_admin(request, 'api_device_groups')
     if error:
         return error
-    qs = DeviceGroup.objects.all().order_by('name')
+    qs = DeviceGroup.objects.select_related('strategy').order_by('name')
     qs = _filter_text(qs, 'name', request.GET.get('name'))
     return _paged_response(request, qs, _serialize_device_group)
 
@@ -2728,43 +4130,90 @@ def device_group_detail(request, guid):
     admin_user, error = _require_admin(request, 'api_device_group_detail')
     if error:
         return error
-    group = _device_group_by_guid(guid)
-    if not group:
-        return JsonResponse({'error': 'Device group not found'}, status=404)
     if request.method == 'PATCH':
         data = _load_json(request)
-        old_name = group.name
-        if 'name' in data:
-            new_name = str(data.get('name') or '').strip()
-            if not new_name:
-                return JsonResponse({'error': 'name is required'}, status=400)
-            if DeviceGroup.objects.filter(name=new_name).exclude(guid=group.guid).exists():
+        if not isinstance(data, dict) or not data:
+            return JsonResponse({'error': 'Invalid device group'}, status=400)
+        with transaction.atomic():
+            group = DeviceGroup.objects.select_for_update().filter(guid=guid).first()
+            if not group:
+                return JsonResponse({'error': 'Device group not found'}, status=404)
+            if 'name' in data:
+                new_name = _model_text_value(
+                    data.get('name'),
+                    DeviceGroup,
+                    'name',
+                    allow_empty=False,
+                )
+                if new_name is None:
+                    return JsonResponse({'error': 'Invalid name'}, status=400)
+                group.name = new_name
+            if 'note' in data:
+                note = _model_text_value(
+                    data.get('note'),
+                    DeviceGroup,
+                    'note',
+                    strip=False,
+                    max_bytes=4096,
+                )
+                if note is None:
+                    return JsonResponse({'error': 'Invalid note'}, status=400)
+                group.note = note
+            if 'allowed_incomings' in data:
+                allowed_incomings = _allowed_incomings_value(
+                    data.get('allowed_incomings')
+                )
+                if allowed_incomings is None:
+                    return JsonResponse(
+                        {'error': 'Invalid allowed_incomings'},
+                        status=400,
+                    )
+                group.allowed_incomings = allowed_incomings
+            if 'strategy_name' in data:
+                strategy_name = _bounded_text_value(
+                    data.get('strategy_name'),
+                    240,
+                )
+                if strategy_name is not None:
+                    strategy_name = strategy_name.strip()
+                if strategy_name is None:
+                    return JsonResponse({'error': 'Invalid strategy'}, status=400)
+                strategy = (
+                    StrategyProfile.objects.filter(name=strategy_name).first()
+                    if strategy_name
+                    else None
+                )
+                if strategy_name and not strategy:
+                    return JsonResponse({'error': 'Strategy not found'}, status=404)
+                group.strategy = strategy
+            try:
+                group.save()
+            except IntegrityError:
                 return JsonResponse({'error': 'Device group already exists'}, status=409)
-            group.name = new_name
-        if 'note' in data:
-            group.note = str(data.get('note') or '')
-        if 'allowed_incomings' in data:
-            group.allowed_incomings = json.dumps(data.get('allowed_incomings') or [], ensure_ascii=False)
-        if 'strategy_name' in data:
-            group.strategy_name = str(data.get('strategy_name') or '')
-        try:
-            group.save()
-        except IntegrityError:
-            return JsonResponse({'error': 'Device group already exists'}, status=409)
-        if old_name != group.name:
-            RustDesDevice.objects.filter(device_group_name=old_name).update(device_group_name=group.name)
         return JsonResponse(_serialize_device_group(group))
     if request.method == 'POST':
         ids = _load_json(request)
-        if not isinstance(ids, list):
+        ids = _identifier_list(ids)
+        if ids is None or any(
+            not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item)
+            for item in ids
+        ):
             return JsonResponse({'error': 'Device id list required'}, status=400)
-        updated = RustDesDevice.objects.filter(rid__in=[str(x) for x in ids]).update(device_group_name=group.name)
+        group = _device_group_by_guid(guid)
+        if not group:
+            return JsonResponse({'error': 'Device group not found'}, status=404)
+        updated = RustDeskDevice.objects.filter(
+            rid__in=[str(x) for x in ids]
+        ).update(device_group=group)
         _log_event(request, 'api_device_group_add_devices', username=admin_user.username, target=group.name, updated=updated)
         return JsonResponse({'result': 'OK', 'updated': updated})
     if request.method == 'DELETE':
-        name = group.name
-        RustDesDevice.objects.filter(device_group_name=name).update(device_group_name='')
-        group.delete()
+        with transaction.atomic():
+            group = DeviceGroup.objects.select_for_update().filter(guid=guid).first()
+            if not group:
+                return JsonResponse({'error': 'Device group not found'}, status=404)
+            name = group.name
+            group.delete()
         _log_event(request, 'api_device_group_deleted', username=admin_user.username, target=name)
         return JsonResponse({'result': 'OK'})
     return JsonResponse({'error': 'POST, PATCH or DELETE required'}, status=405)
@@ -2780,19 +4229,57 @@ def device_group_remove_devices(request, guid):
     if not group:
         return JsonResponse({'error': 'Device group not found'}, status=404)
     ids = _load_json(request)
-    if not isinstance(ids, list):
+    ids = _identifier_list(ids)
+    if ids is None or any(
+        not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item)
+        for item in ids
+    ):
         return JsonResponse({'error': 'Device id list required'}, status=400)
-    updated = RustDesDevice.objects.filter(rid__in=[str(x) for x in ids], device_group_name=group.name).update(device_group_name='')
+    updated = RustDeskDevice.objects.filter(
+        rid__in=[str(x) for x in ids],
+        device_group=group,
+    ).update(device_group=None)
     _log_event(request, 'api_device_group_remove_devices', username=admin_user.username, target=group.name, updated=updated)
     return JsonResponse({'result': 'OK', 'updated': updated})
 
 
 def strategies(request):
-    if request.method != 'GET':
-        return JsonResponse({'error': _('错误的提交方式！')}, status=405)
     admin_user, error = _require_admin(request, 'api_strategies')
     if error:
         return error
+    if request.method == 'POST':
+        data = _load_json(request)
+        if not isinstance(data, dict):
+            return JsonResponse({'error': 'Invalid strategy'}, status=400)
+        name = _model_text_value(
+            data.get('name'),
+            StrategyProfile,
+            'name',
+            allow_empty=False,
+        )
+        options = _strategy_options_value(
+            data.get('config_options', {}),
+        )
+        enabled = _strict_bool(data.get('enabled', True))
+        if name is None or options is None or enabled is None:
+            return JsonResponse({'error': 'Invalid strategy'}, status=400)
+        try:
+            strategy = StrategyProfile.objects.create(
+                name=name,
+                config_options=options,
+                enabled=enabled,
+            )
+        except IntegrityError:
+            return JsonResponse({'error': 'Strategy already exists'}, status=409)
+        _log_event(
+            request,
+            'api_strategy_created',
+            username=admin_user.username,
+            target=name,
+        )
+        return JsonResponse(_serialize_strategy(strategy))
+    if request.method != 'GET':
+        return JsonResponse({'error': _('错误的提交方式！')}, status=405)
     qs = StrategyProfile.objects.all().order_by('name')
     return JsonResponse([_serialize_strategy(strategy) for strategy in qs], safe=False)
 
@@ -2801,12 +4288,77 @@ def strategy_detail(request, guid):
     admin_user, error = _require_admin(request, 'api_strategy_detail')
     if error:
         return error
-    strategy = StrategyProfile.objects.filter(guid=guid).first()
-    if not strategy:
-        return JsonResponse({'error': 'Strategy not found'}, status=404)
-    if request.method != 'GET':
-        return JsonResponse({'error': _('错误的提交方式！')}, status=405)
-    return JsonResponse(_serialize_strategy(strategy))
+    if request.method == 'GET':
+        strategy = StrategyProfile.objects.filter(guid=guid).first()
+        if not strategy:
+            return JsonResponse({'error': 'Strategy not found'}, status=404)
+        return JsonResponse(_serialize_strategy(strategy))
+    if request.method == 'PATCH':
+        data = _load_json(request)
+        if not isinstance(data, dict) or not data:
+            return JsonResponse({'error': 'Invalid strategy'}, status=400)
+        with transaction.atomic():
+            strategy = StrategyProfile.objects.select_for_update().filter(
+                guid=guid
+            ).first()
+            if not strategy:
+                return JsonResponse({'error': 'Strategy not found'}, status=404)
+            if 'name' in data:
+                name = _model_text_value(
+                    data.get('name'),
+                    StrategyProfile,
+                    'name',
+                    allow_empty=False,
+                )
+                if name is None:
+                    return JsonResponse({'error': 'Invalid strategy name'}, status=400)
+                strategy.name = name
+            if 'config_options' in data:
+                options = _strategy_options_value(
+                    data.get('config_options'),
+                )
+                if options is None:
+                    return JsonResponse(
+                        {'error': 'Invalid strategy options'},
+                        status=400,
+                    )
+                strategy.config_options = options
+            if 'enabled' in data:
+                enabled = _strict_bool(data.get('enabled'))
+                if enabled is None:
+                    return JsonResponse(
+                        {'error': 'Invalid enabled value'},
+                        status=400,
+                    )
+                strategy.enabled = enabled
+            try:
+                strategy.save()
+            except IntegrityError:
+                return JsonResponse({'error': 'Strategy already exists'}, status=409)
+        _log_event(
+            request,
+            'api_strategy_updated',
+            username=admin_user.username,
+            target=strategy.name,
+        )
+        return JsonResponse(_serialize_strategy(strategy))
+    if request.method == 'DELETE':
+        with transaction.atomic():
+            strategy = StrategyProfile.objects.select_for_update().filter(
+                guid=guid
+            ).first()
+            if not strategy:
+                return JsonResponse({'error': 'Strategy not found'}, status=404)
+            name = strategy.name
+            strategy.delete()
+        _log_event(
+            request,
+            'api_strategy_deleted',
+            username=admin_user.username,
+            target=name,
+        )
+        return JsonResponse({'result': 'OK'})
+    return JsonResponse({'error': 'GET, PATCH or DELETE required'}, status=405)
 
 
 def strategy_status(request, guid):
@@ -2819,7 +4371,14 @@ def strategy_status(request, guid):
     if not strategy:
         return JsonResponse({'error': 'Strategy not found'}, status=404)
     data = _load_json(request)
-    strategy.enabled = _coerce_bool(data if isinstance(data, bool) else data.get('enabled', True), True)
+    enabled = _strict_bool(
+        data if isinstance(data, bool) else data.get('enabled')
+        if isinstance(data, dict)
+        else None
+    )
+    if enabled is None:
+        return JsonResponse({'error': 'Boolean enabled value required'}, status=400)
+    strategy.enabled = enabled
     strategy.save(update_fields=['enabled', 'updated_at'])
     _log_event(request, 'api_strategy_status', username=admin_user.username, target=strategy.name, enabled=strategy.enabled)
     return JsonResponse(_serialize_strategy(strategy))
@@ -2832,28 +4391,37 @@ def strategy_assign(request):
     if error:
         return error
     data = _load_json(request)
-    strategy_name = ''
+    if not isinstance(data, dict):
+        return JsonResponse({'error': 'Invalid strategy assignment'}, status=400)
+    strategy = None
     strategy_guid = data.get('strategy')
     if strategy_guid:
+        if not isinstance(strategy_guid, str) or len(strategy_guid) > 64:
+            return JsonResponse({'error': 'Invalid strategy'}, status=400)
         strategy = StrategyProfile.objects.filter(guid=strategy_guid).first()
         if not strategy:
             return JsonResponse({'error': 'Strategy not found'}, status=404)
-        strategy_name = strategy.name
-    peer_guids = [str(x) for x in data.get('peers') or []]
-    user_guids = [str(x) for x in data.get('users') or []]
-    group_guids = [str(x) for x in data.get('groups') or []]
-    devices_updated = RustDesDevice.objects.filter(pk__in=peer_guids).update(strategy_name=strategy_name)
-    users_updated = UserProfile.objects.filter(pk__in=user_guids).update(strategy_name=strategy_name)
-    groups = DeviceGroup.objects.filter(guid__in=group_guids)
-    group_names = list(groups.values_list('name', flat=True))
-    groups_updated = groups.update(strategy_name=strategy_name)
-    if group_names:
-        RustDesDevice.objects.filter(device_group_name__in=group_names).update(strategy_name=strategy_name)
+    peer_guids = _identifier_list(data.get('peers', []), numeric=True)
+    user_guids = _identifier_list(data.get('users', []), numeric=True)
+    group_guids = _identifier_list(data.get('groups', []))
+    if peer_guids is None or user_guids is None or group_guids is None:
+        return JsonResponse({'error': 'Invalid assignment targets'}, status=400)
+    if not peer_guids and not user_guids and not group_guids:
+        return JsonResponse({'error': 'No assignment targets'}, status=400)
+    with transaction.atomic():
+        devices_updated = RustDeskDevice.objects.filter(pk__in=peer_guids).update(
+            strategy=strategy
+        )
+        users_updated = UserProfile.objects.filter(pk__in=user_guids).update(
+            strategy=strategy
+        )
+        groups = DeviceGroup.objects.filter(guid__in=group_guids)
+        groups_updated = groups.update(strategy=strategy)
     _log_event(
         request,
         'api_strategy_assign',
         username=admin_user.username,
-        strategy=strategy_name,
+        strategy=strategy.name if strategy else '',
         devices=devices_updated,
         users=users_updated,
         groups=groups_updated,

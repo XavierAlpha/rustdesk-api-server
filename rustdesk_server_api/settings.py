@@ -1,8 +1,15 @@
+import ipaddress
+import base64
+import binascii
+import hashlib
 import os
+import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import django
 from django.core.exceptions import ImproperlyConfigured
+from django.utils.csp import CSP
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DJANGO_FORMS_TEMPLATES = Path(django.__file__).resolve().parent / 'forms' / 'templates'
@@ -34,6 +41,23 @@ def env_int(name, default, min_value=None, max_value=None):
     return value
 
 
+def valid_https_url(value, *, allow_query=True):
+    if not isinstance(value, str) or not value or len(value) > 2048:
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment
+        and (allow_query or not parsed.query)
+    )
+
+
 DEBUG = env_bool("DEBUG", False)
 SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
 if not SECRET_KEY:
@@ -41,16 +65,67 @@ if not SECRET_KEY:
         SECRET_KEY = "dev-only-insecure-secret-key"
     else:
         raise ImproperlyConfigured("SECRET_KEY must be set when DEBUG is false")
+if not DEBUG and (
+    len(SECRET_KEY) < 50
+    or SECRET_KEY.startswith("dev-only-")
+    or "replace-with" in SECRET_KEY.lower()
+):
+    raise ImproperlyConfigured(
+        "SECRET_KEY must be an unpredictable value of at least 50 characters"
+    )
+
+_data_encryption_key = os.environ.get("DATA_ENCRYPTION_KEY", "").strip()
+if _data_encryption_key:
+    try:
+        DATA_ENCRYPTION_KEY_BYTES = base64.b64decode(
+            _data_encryption_key,
+            validate=True,
+        )
+    except (binascii.Error, ValueError) as exc:
+        raise ImproperlyConfigured(
+            "DATA_ENCRYPTION_KEY must be canonical Base64"
+        ) from exc
+    if (
+        len(DATA_ENCRYPTION_KEY_BYTES) != 32
+        or base64.b64encode(DATA_ENCRYPTION_KEY_BYTES).decode("ascii")
+        != _data_encryption_key
+    ):
+        raise ImproperlyConfigured(
+            "DATA_ENCRYPTION_KEY must encode exactly 32 bytes"
+        )
+elif DEBUG:
+    DATA_ENCRYPTION_KEY_BYTES = hashlib.sha256(
+        f"development-data-key:{SECRET_KEY}".encode()
+    ).digest()
+else:
+    raise ImproperlyConfigured(
+        "DATA_ENCRYPTION_KEY is required when DEBUG is false"
+    )
 
 DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 ALLOWED_HOSTS = env_csv("ALLOWED_HOSTS", ["127.0.0.1", "localhost"])
 CSRF_TRUSTED_ORIGINS = env_csv("CSRF_TRUSTED_ORIGINS", ["http://127.0.0.1:21114"])
-# Relaxed so the bundled Flutter web client can complete popup-based OIDC flows.
-SECURE_CROSS_ORIGIN_OPENER_POLICY = None
+# The OIDC client polls server-side state and deliberately clears popup.opener,
+# so every response can retain full cross-origin opener isolation.
+SECURE_CROSS_ORIGIN_OPENER_POLICY = "same-origin"
 
 # Only enable behind a reverse proxy that overwrites X-Forwarded-For / X-Real-IP;
 # otherwise clients can choose the address the login lockout is keyed on.
 TRUST_PROXY_HEADERS = env_bool("TRUST_PROXY_HEADERS", False)
+TRUSTED_PROXY_CIDRS = env_csv("TRUSTED_PROXY_CIDRS")
+try:
+    TRUSTED_PROXY_NETWORKS = tuple(
+        ipaddress.ip_network(value, strict=False)
+        for value in TRUSTED_PROXY_CIDRS
+    )
+except ValueError as exc:
+    raise ImproperlyConfigured(
+        "TRUSTED_PROXY_CIDRS contains an invalid network"
+    ) from exc
+if TRUST_PROXY_HEADERS and not TRUSTED_PROXY_NETWORKS:
+    raise ImproperlyConfigured(
+        "TRUSTED_PROXY_CIDRS is required when TRUST_PROXY_HEADERS is enabled"
+    )
 
 # TLS-terminating deployments (reverse proxy or direct) should set SECURE_TLS=true.
 _secure_tls = env_bool("SECURE_TLS", False)
@@ -64,11 +139,18 @@ SECURE_HSTS_SECONDS = env_int(
     0,
     63072000,
 )
-SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", _secure_tls)
-SECURE_HSTS_PRELOAD = env_bool("SECURE_HSTS_PRELOAD", _secure_tls)
+# Neither option is safe to infer merely from the API endpoint using TLS:
+# sibling hostnames may still serve HTTP, and preload is a long-lived external
+# commitment. Operators must opt in after reviewing the entire DNS namespace.
+SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", False)
+SECURE_HSTS_PRELOAD = env_bool("SECURE_HSTS_PRELOAD", False)
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "same-origin"
 SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
+SESSION_COOKIE_AGE = env_int("SESSION_COOKIE_AGE_SECONDS", 8 * 60 * 60, 300, 7 * 24 * 60 * 60)
+SESSION_EXPIRE_AT_BROWSER_CLOSE = True
 AUTH_USER_MODEL = "api.UserProfile"
 
 ID_SERVER = os.environ.get("ID_SERVER", "").strip()
@@ -77,23 +159,80 @@ RS_PUB_KEY = os.environ.get("RS_PUB_KEY", "").strip()
 RELAY_SERVER = os.environ.get("RELAY_SERVER", "").strip()
 DEFAULT_ID_PORT = env_int("DEFAULT_ID_PORT", 21116, 1, 65535)
 PLUGIN_SIGNING_KEY = os.environ.get("PLUGIN_SIGNING_KEY", "").strip()
+DEVICE_VERIFICATION_TOKEN = os.environ.get("DEVICE_VERIFICATION_TOKEN", "").strip()
+if DEVICE_VERIFICATION_TOKEN and (
+    not 32 <= len(DEVICE_VERIFICATION_TOKEN) <= 512
+    or any(character.isspace() for character in DEVICE_VERIFICATION_TOKEN)
+):
+    raise ImproperlyConfigured(
+        "DEVICE_VERIFICATION_TOKEN must contain 32-512 non-whitespace characters"
+    )
+if not DEBUG and not DEVICE_VERIFICATION_TOKEN:
+    raise ImproperlyConfigured(
+        "DEVICE_VERIFICATION_TOKEN is required when DEBUG is false"
+    )
 
 OIDC_PROVIDERS = {}
+OIDC_HTTP_TIMEOUT_SECONDS = env_int("OIDC_HTTP_TIMEOUT_SECONDS", 10, 2, 60)
 _oidc_name = os.environ.get("OIDC_NAME", "").strip()
 _oidc_issuer = os.environ.get("OIDC_ISSUER", "").strip()
 _oidc_client_id = os.environ.get("OIDC_CLIENT_ID", "").strip()
 _oidc_client_secret = os.environ.get("OIDC_CLIENT_SECRET", "").strip()
 _oidc_redirect_uri = os.environ.get("OIDC_REDIRECT_URI", "").strip()
-if _oidc_name and _oidc_issuer and _oidc_client_id and _oidc_client_secret and _oidc_redirect_uri:
+_oidc_values = (
+    _oidc_name,
+    _oidc_issuer,
+    _oidc_client_id,
+    _oidc_client_secret,
+    _oidc_redirect_uri,
+)
+if any(_oidc_values) and not all(_oidc_values):
+    raise ImproperlyConfigured(
+        "OIDC_NAME, OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET and "
+        "OIDC_REDIRECT_URI must be configured together"
+    )
+if all(_oidc_values):
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", _oidc_name):
+        raise ImproperlyConfigured("OIDC_NAME contains unsupported characters")
+    if not valid_https_url(_oidc_issuer, allow_query=False):
+        raise ImproperlyConfigured("OIDC_ISSUER must be a canonical HTTPS URL")
+    if not valid_https_url(_oidc_redirect_uri):
+        raise ImproperlyConfigured("OIDC_REDIRECT_URI must be an HTTPS URL")
+    _oidc_issuer_host = (urlsplit(_oidc_issuer).hostname or "").lower()
+    _oidc_allowed_hosts = env_csv(
+        "OIDC_ALLOWED_HOSTS",
+        [_oidc_issuer_host],
+    )
+    if any(
+        not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", host)
+        or host.startswith(".")
+        or host.endswith(".")
+        for host in _oidc_allowed_hosts
+    ):
+        raise ImproperlyConfigured(
+            "OIDC_ALLOWED_HOSTS must contain exact DNS hostnames"
+        )
+    _oidc_allowed_hosts = tuple(
+        dict.fromkeys(host.lower() for host in _oidc_allowed_hosts)
+    )
+    if _oidc_issuer_host not in _oidc_allowed_hosts:
+        raise ImproperlyConfigured(
+            "OIDC_ALLOWED_HOSTS must include the issuer hostname"
+        )
+    _oidc_scope = os.environ.get("OIDC_SCOPE", "openid email profile").strip()
+    if "openid" not in _oidc_scope.split():
+        raise ImproperlyConfigured("OIDC_SCOPE must include openid")
     OIDC_PROVIDERS[_oidc_name] = {
         "issuer": _oidc_issuer,
         "client_id": _oidc_client_id,
         "client_secret": _oidc_client_secret,
         "redirect_uri": _oidc_redirect_uri,
-        "scope": os.environ.get("OIDC_SCOPE", "openid email profile"),
+        "scope": _oidc_scope,
+        "allowed_hosts": _oidc_allowed_hosts,
     }
 
 ALLOW_REGISTRATION = env_bool("ALLOW_REGISTRATION", False)
+MAX_PASSWORD_LENGTH = 128
 
 # Recording uploads contain highly sensitive session data. Keep each request
 # bounded before Django materializes request.body, and cap the resulting file so
@@ -112,6 +251,9 @@ RECORD_UPLOAD_MAX_FILE_BYTES = env_int(
 )
 RECORD_UPLOAD_ROOT = Path(os.environ.get("RECORD_UPLOAD_ROOT", BASE_DIR / "records"))
 DATA_UPLOAD_MAX_MEMORY_SIZE = RECORD_UPLOAD_MAX_CHUNK_BYTES
+DATA_UPLOAD_MAX_NUMBER_FIELDS = env_int("DATA_UPLOAD_MAX_NUMBER_FIELDS", 1000, 100, 10000)
+DATA_UPLOAD_MAX_NUMBER_FILES = 0
+FILE_UPLOAD_PERMISSIONS = 0o600
 
 
 # ==========数据库配置 开始=====================
@@ -141,6 +283,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'django.middleware.csp.ContentSecurityPolicyMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -161,6 +304,7 @@ TEMPLATES = [
             'context_processors': [
                 'django.template.context_processors.debug',
                 'django.template.context_processors.request',
+                'django.template.context_processors.csp',
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
                 'api.util.settings',
@@ -189,8 +333,38 @@ if DATABASE_TYPE == "MYSQL" and MYSQL_DBNAME != "-" and MYSQL_USER != "-" and MY
             "USER": MYSQL_USER,
             "PASSWORD": MYSQL_PASSWORD,
             "PORT": MYSQL_PORT,
-            "OPTIONS": {"charset": "utf8mb4"},
+            "CONN_MAX_AGE": env_int("DATABASE_CONN_MAX_AGE", 60, 0, 3600),
+            "CONN_HEALTH_CHECKS": True,
+            "OPTIONS": {
+                "charset": "utf8mb4",
+                "connect_timeout": env_int(
+                    "DATABASE_CONNECT_TIMEOUT",
+                    10,
+                    1,
+                    60,
+                ),
+                "init_command": (
+                    "SET sql_mode='STRICT_TRANS_TABLES,"
+                    "ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'"
+                ),
+            },
         }
+    }
+elif DATABASE_TYPE == "MYSQL":
+    raise ImproperlyConfigured(
+        "MYSQL_DBNAME, MYSQL_USER and MYSQL_PASSWORD are required for MySQL"
+    )
+elif DATABASE_TYPE != "SQLITE":
+    raise ImproperlyConfigured("DATABASE_TYPE must be SQLITE or MYSQL")
+else:
+    DATABASES["default"]["OPTIONS"] = {
+        "timeout": env_int("SQLITE_BUSY_TIMEOUT_SECONDS", 20, 1, 300),
+        "transaction_mode": "IMMEDIATE",
+        "init_command": (
+            "PRAGMA journal_mode=WAL;"
+            "PRAGMA synchronous=NORMAL;"
+            "PRAGMA busy_timeout=20000"
+        ),
     }
 
 # Password validation
@@ -270,6 +444,25 @@ STORAGES = {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
     },
 }
+
+SECURE_CSP = {
+    "default-src": [CSP.SELF],
+    "base-uri": [CSP.SELF],
+    "connect-src": [CSP.SELF, "https:", "wss:"],
+    "font-src": [CSP.SELF, "data:"],
+    "form-action": [CSP.SELF],
+    "frame-ancestors": [CSP.NONE],
+    "img-src": [CSP.SELF, "data:", "blob:"],
+    "object-src": [CSP.NONE],
+    "script-src": [CSP.SELF, CSP.NONCE, CSP.WASM_UNSAFE_EVAL],
+    # Flutter and Django form widgets create style declarations at runtime.
+    # Script execution remains nonce-bound, and user-controlled color values
+    # are normalized before rendering.
+    "style-src": [CSP.SELF, CSP.UNSAFE_INLINE],
+    "worker-src": [CSP.SELF, "blob:"],
+}
+SECURE_CSP_REPORT_ONLY = {}
+X_FRAME_OPTIONS = "DENY"
 
 MEDIA_ROOT = BASE_DIR / "records"
 MEDIA_URL = "/records/"

@@ -1,13 +1,15 @@
 from django.shortcuts import render
 from django.http import HttpResponseRedirect
 from django.http import JsonResponse
-from django.db import IntegrityError
-from django.db.models import Q
+from django.db import IntegrityError, transaction
+from django.db.models import Count, Prefetch, Q
 from django.contrib.auth.decorators import login_required
 from django.contrib import auth, messages
+from django.contrib.auth import password_validation
+from django.core.exceptions import ValidationError
 from api.models import (
     RustDeskPeer,
-    RustDesDevice,
+    RustDeskDevice,
     UserProfile,
     RustDeskTag,
     ShareLink,
@@ -17,6 +19,7 @@ from api.models import (
     AddressBookShare,
     AddressBookRule,
     AddressBookRuleAudit,
+    LoginAttempt,
 )
 from django.forms.models import model_to_dict
 from django.core.paginator import Paginator
@@ -28,7 +31,9 @@ from django.utils import timezone
 from itertools import chain
 from django.db.models.fields import DateTimeField, DateField, CharField, TextField
 from django.db.models import Model
+import datetime
 import json
+import hashlib
 import secrets
 import sys
 import logging
@@ -36,12 +41,17 @@ import uuid
 
 from io import StringIO
 from urllib.parse import urlencode
-import csv
 from django.utils.translation import gettext as _
 
-from api.xlsx import xlsx_response
+from api.xlsx import safe_csv_writer, xlsx_response
+from api.formatting import format_bytes
+from api.request_utils import client_ip
+from api.tag_colors import normalize_tag_color, tag_color_css
 
 logger = logging.getLogger(__name__)
+MAX_AB_PEERS = 10_000
+MAX_AB_TAGS = 256
+MAX_AB_TAGS_PER_PEER = 32
 
 
 def _filename_stamp():
@@ -49,10 +59,7 @@ def _filename_stamp():
 
 
 def _client_ip(request):
-    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-    if x_forwarded_for:
-        return x_forwarded_for.split(',')[0].strip()
-    return request.META.get('REMOTE_ADDR', '')
+    return client_ip(request)
 
 
 def _log_event(request, event, level="info", **extra):
@@ -66,7 +73,7 @@ def _log_event(request, event, level="info", **extra):
         'method': getattr(request, 'method', ''),
     }
     payload.update({k: v for k, v in extra.items() if v is not None})
-    details = json.dumps(payload, ensure_ascii=False)
+    details = json.dumps(payload, ensure_ascii=False, default=str)
     log_fn = getattr(logger, level, logger.info)
     log_fn("event=%s details=%s", event, details)
 
@@ -119,12 +126,7 @@ def model_to_dict2(instance, fields=None, exclude=None, replace=None, default=No
             value = getattr(instance, key)
             value = value.strftime('%Y-%m-%d') if value else ''
         elif type(f) == CharField or type(f) == TextField:   # noqa
-            # 字符串数据是否可以进行序列化，转成python结构数据
             value = getattr(instance, key)
-            try:
-                value = json.loads(value)
-            except Exception as _:  # noqa
-                value = value
         else:  # 其他类型的字段
             # value = getattr(instance, key)
             key = f.name
@@ -188,35 +190,49 @@ def user_action(request):
         return user_register(request)
     elif action == 'logout':
         return user_logout(request)
-    else:
-        return
+    return JsonResponse({'error': _('未知操作。')}, status=404)
 
 
 def user_login(request):
     if request.method == 'GET':
         _log_event(request, 'front_login_view', level="debug")
         return render(request, 'login.html')
+    if request.method != 'POST':
+        return JsonResponse({'code': 0, 'msg': _('请求方式错误。')}, status=405)
 
     username = request.POST.get('account', '').strip()
     password = request.POST.get('password', '')
-    if not username or not password:
-        return JsonResponse({'code': 0, 'msg': _('出了点问题，未获取用户名或密码。')})
+    if (
+        not username
+        or len(username) > UserProfile._meta.get_field('username').max_length
+        or not password
+        or len(password) > settings.MAX_PASSWORD_LENGTH
+    ):
+        return JsonResponse({'code': 0, 'msg': _('登录信息无效。')}, status=400)
 
+    from api.views_api import _login_locked, _record_login_failure
+
+    client_ip = _client_ip(request)
+    if _login_locked(client_ip, username):
+        _log_event(request, 'front_login_locked', level="warning", username=username)
+        return JsonResponse({'code': 0, 'msg': _('尝试次数过多，请稍后再试。')}, status=429)
     user = auth.authenticate(username=username, password=password)
     if not user:
-        candidate = UserProfile.objects.filter(Q(username__iexact=username)).first()
-        if candidate and candidate.check_password(password):
-            candidate.backend = 'django.contrib.auth.backends.ModelBackend'
-            user = candidate
-        else:
-            reason = 'password_mismatch' if candidate else 'user_not_found'
-            _log_event(request, 'front_login_failed', level="warning", username=username, reason=reason)
-            return JsonResponse({'code': 0, 'msg': _('帐号或密码错误！')})
+        _record_login_failure(client_ip, username)
+        _log_event(request, 'front_login_failed', level="warning", username=username)
+        return JsonResponse({'code': 0, 'msg': _('帐号或密码错误！')}, status=401)
     if user and not user.is_active:
         _log_event(request, 'front_login_denied', level="warning", username=username, reason='inactive')
-        return JsonResponse({'code': 0, 'msg': _('帐号未激活，请联系管理员。')})
+        return JsonResponse(
+            {'code': 0, 'msg': _('帐号未激活，请联系管理员。')},
+            status=403,
+        )
     if user:
         auth.login(request, user)
+        LoginAttempt.objects.filter(
+            ip=client_ip,
+            username=username.casefold(),
+        ).delete()
         _log_event(request, 'front_login_success', username=username)
         return JsonResponse({'code': 1, 'url': '/api/home'})
     return JsonResponse({'code': 0, 'msg': _('帐号或密码错误！')})
@@ -227,6 +243,8 @@ def user_register(request):
     if request.method == 'GET':
         _log_event(request, 'front_register_view', level="debug")
         return render(request, 'reg.html')
+    if request.method != 'POST':
+        return JsonResponse({'code': 0, 'msg': _('请求方式错误。')}, status=405)
     ALLOW_REGISTRATION = settings.ALLOW_REGISTRATION
     result = {
         'code': 0,
@@ -235,39 +253,63 @@ def user_register(request):
     if not ALLOW_REGISTRATION:
         result['msg'] = _('当前未开放注册，请联系管理员！')
         _log_event(request, 'front_register_denied', level="warning", reason='registration_disabled')
-        return JsonResponse(result)
+        return JsonResponse(result, status=403)
 
     username = request.POST.get('user', '').strip()
     password1 = request.POST.get('pwd', '')
+    password2 = request.POST.get('repassword', '')
+    from api.views_api import _login_locked, _record_login_failure
 
-    if len(username) <= 3:
-        info = _('用户名不得小于3位')
+    client_ip = _client_ip(request)
+    rate_key = f"register:{username}"
+    if _login_locked(client_ip, rate_key):
+        return JsonResponse({'code': 0, 'msg': _('尝试次数过多，请稍后再试。')}, status=429)
+    _record_login_failure(client_ip, rate_key)
+
+    if (
+        not 3 <= len(username) <= UserProfile._meta.get_field('username').max_length
+        or any(ord(character) < 32 for character in username)
+    ):
+        info = _('用户名长度或格式不符合要求。')
         result['msg'] = info
-        _log_event(request, 'front_register_failed', level="warning", username=username, reason='username_too_short')
-        return JsonResponse(result)
+        _log_event(request, 'front_register_failed', level="warning", username=username, reason='invalid_username')
+        return JsonResponse(result, status=400)
+    try:
+        UserProfile._meta.get_field('username').run_validators(username)
+    except ValidationError:
+        result['msg'] = _('用户名长度或格式不符合要求。')
+        _log_event(request, 'front_register_failed', level="warning", username=username, reason='invalid_username')
+        return JsonResponse(result, status=400)
 
-    if len(password1) < 8 or len(password1) > 20:
-        info = _('密码长度不符合要求, 应在8~20位。')
+    if (
+        not isinstance(password1, str)
+        or not isinstance(password2, str)
+        or len(password1) > settings.MAX_PASSWORD_LENGTH
+        or password1 != password2
+    ):
+        info = _('密码格式不符合要求。')
         result['msg'] = info
-        _log_event(request, 'front_register_failed', level="warning", username=username, reason='password_length')
-        return JsonResponse(result)
+        _log_event(request, 'front_register_failed', level="warning", username=username, reason='invalid_password')
+        return JsonResponse(result, status=400)
+    try:
+        password_validation.validate_password(password1)
+    except ValidationError:
+        result['msg'] = _('密码强度不足，请使用更长且不常见的密码。')
+        _log_event(request, 'front_register_failed', level="warning", username=username, reason='weak_password')
+        return JsonResponse(result, status=400)
 
-    if UserProfile.objects.filter(Q(username=username)).exists():
+    if UserProfile.objects.filter(username__iexact=username).exists():
         info = _('用户名已存在。')
         result['msg'] = info
         _log_event(request, 'front_register_failed', level="warning", username=username, reason='username_exists')
-        return JsonResponse(result)
+        return JsonResponse(result, status=409)
     try:
         UserProfile.objects.create_user(
             username=username,
             password=password1,
-            rid='',
-            uuid='',
-            rtype='',
-            deviceInfo='',
             is_active=True,
         )
-    except IntegrityError:
+    except (IntegrityError, ValidationError):
         result['msg'] = _('用户名已存在。')
         _log_event(request, 'front_register_failed', level="warning", username=username, reason='username_exists')
         return JsonResponse(result, status=409)
@@ -279,7 +321,8 @@ def user_register(request):
 
 @login_required(login_url='/api/user_action?action=login')
 def user_logout(request):
-    # info=''
+    if request.method != 'POST':
+        return JsonResponse({'error': _('请求方式错误。')}, status=405)
     auth.logout(request)
     _log_event(request, 'front_logout')
     return HttpResponseRedirect('/api/user_action?action=login')
@@ -287,12 +330,33 @@ def user_logout(request):
 
 def get_single_info(uid):
     user = UserProfile.objects.filter(Q(id=uid)).first()
-    legacy_peers = {x.rid: model_to_dict(x) for x in RustDeskPeer.objects.filter(Q(uid=uid))}
-    devices = RustDesDevice.objects.filter(Q(owner_id=uid) | Q(rid__in=legacy_peers.keys())).distinct()
+    personal_guid = _personal_guid(user) if user else ''
+    legacy_peers = {
+        peer.rid: model_to_dict(peer, exclude=('tags',))
+        for peer in RustDeskPeer.objects.filter(
+            profile__owner_id=uid,
+            profile__guid=personal_guid,
+        )
+    }
+    devices = RustDeskDevice.objects.filter(
+        Q(owner_id=uid) | Q(rid__in=legacy_peers.keys())
+    ).select_related(
+        'owner__strategy',
+        'device_group__strategy',
+        'strategy',
+    ).distinct()
     now = timezone.now()
     items = {}
     for device in devices:
         item = model_to_dict2(device)
+        item['owner_name'] = device.owner.username if device.owner else ''
+        item['device_group_name'] = (
+            device.device_group.name if device.device_group_id else ''
+        )
+        effective_strategy = device.effective_strategy()
+        item['strategy_name'] = (
+            effective_strategy.name if effective_strategy else ''
+        )
         legacy = legacy_peers.pop(device.rid, None)
         if legacy:
             for key in ('alias', 'platform', 'rhash', 'password'):
@@ -302,7 +366,7 @@ def get_single_info(uid):
                 item['device_group_name'] = legacy.get('device_group_name', '')
             if not item.get('note'):
                 item['note'] = legacy.get('note', '')
-        item['rust_user'] = item.get('owner_name') or (user.username if user else '')
+        item['rust_user'] = item['owner_name'] or (user.username if user else '')
         item['status'] = _('在线') if (now - device.update_time).total_seconds() <= 120 else _('离线')
         rhash_value = item.get('rhash') or ''
         item['has_rhash'] = _('是') if len(rhash_value) > 1 else _('否')
@@ -321,16 +385,30 @@ def get_single_info(uid):
 
 
 def get_all_info():
-    device_objects = RustDesDevice.objects.all()
-    peers = RustDeskPeer.objects.all()
+    device_objects = RustDeskDevice.objects.select_related(
+        'owner__strategy',
+        'device_group__strategy',
+        'strategy',
+    )
+    peers = RustDeskPeer.objects.filter(
+        profile__guid__startswith='personal-',
+    ).select_related('profile__owner')
     now = timezone.now()
     devices = {}
     for device in device_objects:
         item = model_to_dict2(device)
+        item['owner_name'] = device.owner.username if device.owner else ''
+        item['device_group_name'] = (
+            device.device_group.name if device.device_group_id else ''
+        )
+        effective_strategy = device.effective_strategy()
+        item['strategy_name'] = (
+            effective_strategy.name if effective_strategy else ''
+        )
         item['status'] = _('在线') if (now - device.update_time).total_seconds() <= 120 else _('离线')
         devices[device.rid] = item
     for peer in peers:
-        user = UserProfile.objects.filter(Q(id=peer.uid)).first()
+        user = peer.profile.owner
         device = devices.get(peer.rid, None)
         if device and user:
             devices[peer.rid]['rust_user'] = user.username
@@ -350,6 +428,29 @@ def _get_current_user(request):
     if not user or not getattr(user, 'is_authenticated', False):
         return None
     return user
+
+
+def _find_user(value, *, active_only=False):
+    value = str(value or '').strip()
+    if not value or len(value) > 150:
+        return None
+    query = Q(username__iexact=value)
+    if value.isascii() and value.isdigit():
+        query |= Q(pk=int(value))
+    users = UserProfile.objects.filter(query)
+    if active_only:
+        users = users.filter(is_active=True)
+    return users.order_by('pk').first()
+
+
+def _find_group(value):
+    value = str(value or '').strip()
+    if not value or len(value) > 150:
+        return None
+    query = Q(name=value)
+    if value.isascii() and value.isdigit():
+        query |= Q(pk=int(value))
+    return Group.objects.filter(query).order_by('pk').first()
 
 
 @login_required(login_url='/api/user_action?action=login')
@@ -424,22 +525,27 @@ def _is_reserved_ab_profile_name(name):
 
 def _ensure_personal_profile(user):
     guid = _personal_guid(user)
-    profile = AddressBookProfile.objects.filter(Q(guid=guid)).first()
-    if profile:
+    with transaction.atomic():
+        profile, _created = AddressBookProfile.objects.get_or_create(
+            guid=guid,
+            defaults={
+                'name': _personal_profile_name(),
+                'owner': user,
+                'rule': 3,
+            },
+        )
         if str(profile.owner_id) != str(user.id):
-            profile.owner = user
+            raise IntegrityError('Personal address-book GUID ownership conflict')
+        updates = []
         if not profile.name:
             profile.name = _personal_profile_name()
-        profile.rule = 3
-        profile.save(update_fields=["owner", "name", "rule", "updated_at"])
-        return profile
-    profile = AddressBookProfile(
-        guid=guid,
-        name=_personal_profile_name(),
-        owner=user,
-        rule=3,
-    )
-    profile.save()
+            updates.append('name')
+        if profile.rule != 3:
+            profile.rule = 3
+            updates.append('rule')
+        if updates:
+            updates.append('updated_at')
+            profile.save(update_fields=updates)
     return profile
 
 
@@ -531,6 +637,193 @@ def _normalize_tags(value):
     return cleaned
 
 
+def _peer_tag_list(peer):
+    tags = getattr(peer, 'ordered_tags', None)
+    if tags is None:
+        tags = getattr(peer, '_prefetched_objects_cache', {}).get('tags')
+    if tags is None:
+        tags = list(peer.tags.order_by('tag_name'))
+    else:
+        tags = sorted(tags, key=lambda tag: tag.tag_name)
+    return [tag.tag_name for tag in tags]
+
+
+def _peer_tag_text(peer):
+    return ','.join(_peer_tag_list(peer))
+
+
+def _valid_tag_name(value):
+    value = str(value or '').strip()
+    if (
+        not value
+        or len(value) > 64
+        or len(value.encode()) > 256
+        or ',' in value
+        or any(ord(character) < 32 for character in value)
+    ):
+        return None
+    return value
+
+
+def _valid_tags(value):
+    tags = _normalize_tags(value)
+    if len(tags) > 32:
+        return None
+    return tags if all(_valid_tag_name(tag) == tag for tag in tags) else None
+
+
+def _valid_form_text(value, *, max_chars, max_bytes, strip=True):
+    if not isinstance(value, str):
+        return None
+    value = value.strip() if strip else value
+    if (
+        len(value) > max_chars
+        or len(value.encode()) > max_bytes
+        or any(
+            ord(character) < 32 and character not in '\n\r\t'
+            for character in value
+        )
+    ):
+        return None
+    return value
+
+
+def _valid_peer_id(value):
+    value = _valid_form_text(
+        str(value or '').strip(),
+        max_chars=255,
+        max_bytes=1024,
+    )
+    if not value or any(character.isspace() for character in value):
+        return None
+    return value
+
+
+def _peer_form_payload(post):
+    rid = _valid_peer_id(post.get('rid', ''))
+    alias = _valid_form_text(
+        post.get('alias', ''),
+        max_chars=100,
+        max_bytes=400,
+    )
+    note = _valid_form_text(
+        post.get('note', ''),
+        max_chars=4096,
+        max_bytes=4096,
+    )
+    password = _valid_form_text(
+        post.get('password', ''),
+        max_chars=256,
+        max_bytes=1024,
+        strip=False,
+    )
+    tags = _valid_tags(post.get('tags', ''))
+    if (
+        rid is None
+        or alias is None
+        or note is None
+        or password is None
+        or tags is None
+    ):
+        return None
+    return {
+        'rid': rid,
+        'alias': alias,
+        'note': note,
+        'password': password,
+        'tags': tags,
+    }
+
+
+def _upsert_tag(profile, name, color):
+    with transaction.atomic():
+        AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+        tag = RustDeskTag.objects.filter(
+            profile=profile,
+            tag_name=name,
+        ).first()
+        if tag:
+            tag.tag_color = color
+            tag.save(update_fields=['tag_color'])
+            return True
+        if RustDeskTag.objects.filter(
+            profile=profile,
+        ).count() >= MAX_AB_TAGS:
+            return False
+        RustDeskTag.objects.create(
+            profile=profile,
+            tag_name=name,
+            tag_color=color,
+        )
+        return True
+
+
+def _resolve_profile_tags(profile, tag_names):
+    tag_names = list(dict.fromkeys(tag_names))
+    existing = {
+        tag.tag_name: tag
+        for tag in RustDeskTag.objects.filter(
+            profile=profile,
+            tag_name__in=tag_names,
+        )
+    }
+    missing = [name for name in tag_names if name not in existing]
+    if (
+        RustDeskTag.objects.filter(profile=profile).count() + len(missing)
+        > MAX_AB_TAGS
+    ):
+        return None
+    RustDeskTag.objects.bulk_create(
+        [
+            RustDeskTag(
+                profile=profile,
+                tag_name=name,
+                tag_color='',
+            )
+            for name in missing
+        ],
+        ignore_conflicts=True,
+    )
+    return list(
+        RustDeskTag.objects.filter(
+            profile=profile,
+            tag_name__in=tag_names,
+        )
+    )
+
+
+def _rename_tag(profile, old, new):
+    with transaction.atomic():
+        AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+        old_tag = RustDeskTag.objects.select_for_update().filter(
+            profile=profile,
+            tag_name=old,
+        ).first()
+        if not old_tag:
+            return False
+        target = RustDeskTag.objects.filter(
+            profile=profile,
+            tag_name=new,
+        ).first()
+        if target and target.pk != old_tag.pk:
+            target.peers.add(*old_tag.peers.all())
+            old_tag.delete()
+        else:
+            old_tag.tag_name = new
+            old_tag.save(update_fields=['tag_name'])
+    return True
+
+
+def _delete_tag(profile, name):
+    with transaction.atomic():
+        AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+        deleted = RustDeskTag.objects.filter(
+            profile=profile,
+            tag_name=name,
+        ).delete()[0]
+    return deleted > 0
+
+
 def _rule_target_info(rule_obj):
     if rule_obj.is_everyone:
         return 'everyone', 'Everyone'
@@ -552,7 +845,7 @@ def _rule_target_label(target_type):
 
 def _audit_share(profile, actor, action, share, details=None):
     target_name = share.user.username if share.user else ''
-    payload = {'guid': share.guid}
+    payload = {'guid': str(share.guid)}
     if details:
         payload.update(details)
     _audit_ab_rule(profile, actor, action, 'user', target_name, share.rule, payload)
@@ -560,7 +853,7 @@ def _audit_share(profile, actor, action, share, details=None):
 
 def _audit_rule(profile, actor, action, rule_obj, details=None):
     target_type, target_name = _rule_target_info(rule_obj)
-    payload = {'guid': rule_obj.guid}
+    payload = {'guid': str(rule_obj.guid)}
     if details:
         payload.update(details)
     _audit_ab_rule(profile, actor, action, target_type, target_name, rule_obj.rule, payload)
@@ -687,12 +980,7 @@ def _summarize_rules(rules):
 def _audit_ab_rule(profile, actor, action, target_type, target_name, rule, details=None):
     if not profile:
         return
-    payload = ''
-    if details is not None:
-        try:
-            payload = json.dumps(details, ensure_ascii=False)
-        except Exception:
-            payload = str(details)
+    payload = details if isinstance(details, (dict, list)) else {}
     AddressBookRuleAudit.objects.create(
         profile=profile,
         actor=actor if actor and getattr(actor, 'id', None) else None,
@@ -751,132 +1039,257 @@ def down_peers(request):
 
     _log_event(request, 'front_export_xlsx', username=u.username)
     all_info = get_all_info()
-    all_fields = [x.name for x in RustDesDevice._meta.get_fields()]
+    all_fields = [x.name for x in RustDeskDevice._meta.get_fields()]
     all_fields.append('rust_user')
     rows = [[one.get(name, '-') for name in all_fields] for one in all_info]
     return xlsx_response('DeviceInfo.xlsx', _(u'设备信息表'), all_fields, rows)
 
 
-def check_sharelink_expired(sharelink):
-    now = timezone.now()
-    if sharelink.create_time > now:
-        return False
-    if (now - sharelink.create_time).total_seconds() < 15 * 60:
-        return False
-    else:
-        sharelink.is_expired = True
-        sharelink.save()
-        return True
+MAX_SHARE_PEERS = 20
+MAX_ACTIVE_SHARE_LINKS = 20
+
+
+def _share_token_hash(raw_token):
+    return hashlib.sha256(raw_token.encode()).hexdigest()
+
+
+def _share_message(request, title, message, status=200):
+    return render(
+        request,
+        'msg.html',
+        {
+            'title': _(title),
+            'msg': _(message),
+            'u': request.user,
+            'nav_active': 'share',
+        },
+        status=status,
+    )
 
 
 @login_required(login_url='/api/user_action?action=login')
-def share(request):
+def share(request, share_token=None):
     is_admin = getattr(request.user, 'is_admin', False)
-    if is_admin:
-        peers_qs = RustDeskPeer.objects.all()
-        sharelinks_qs = ShareLink.objects.filter(Q(is_used=False) & Q(is_expired=False))
-    else:
-        peers_qs = RustDeskPeer.objects.filter(Q(uid=request.user.id))
-        sharelinks_qs = ShareLink.objects.filter(Q(uid=request.user.id) & Q(is_used=False) & Q(is_expired=False))
+    now = timezone.now()
+    ShareLink.objects.filter(
+        is_used=False,
+        is_expired=False,
+        expires_at__lte=now,
+    ).update(is_expired=True)
+    ShareLink.objects.filter(
+        Q(is_used=True) | Q(is_expired=True),
+        create_time__lt=now - datetime.timedelta(days=30),
+    ).delete()
 
-    # 省资源：处理已过期请求，不主动定时任务轮询请求，在任意地方请求时，检查是否过期，过期则保存。
-    for sl in sharelinks_qs:
-        check_sharelink_expired(sl)
-    if is_admin:
-        sharelinks_qs = ShareLink.objects.filter(Q(is_used=False) & Q(is_expired=False))
-    else:
-        sharelinks_qs = ShareLink.objects.filter(Q(uid=request.user.id) & Q(is_used=False) & Q(is_expired=False))
+    if share_token is not None:
+        if not secrets.compare_digest(
+            share_token,
+            ''.join(ch for ch in share_token if ch.isalnum() or ch in '-_'),
+        ) or not 32 <= len(share_token) <= 128:
+            return _share_message(request, '错误', '分享链接不存在或已失效。', status=404)
+        token_hash = _share_token_hash(share_token)
+        if request.method == 'GET':
+            link = ShareLink.objects.select_related('creator').filter(
+                shash=token_hash,
+                is_used=False,
+                is_expired=False,
+                expires_at__gt=now,
+            ).first()
+            if not link:
+                return _share_message(request, '错误', '分享链接不存在或已失效。', status=404)
+            if request.user.id == link.creator_id:
+                return _share_message(request, '错误', '不能领取自己创建的分享链接。', status=403)
+            peer_count = link.peers.count()
+            return render(
+                request,
+                'share_accept.html',
+                {
+                    'peer_count': peer_count,
+                    'expires_at': link.expires_at,
+                    'share_token': share_token,
+                    'u': request.user,
+                    'nav_active': 'share',
+                },
+            )
+        if request.method != 'POST':
+            return JsonResponse({'error': 'Method not allowed'}, status=405)
+        with transaction.atomic():
+            link = (
+                ShareLink.objects.select_for_update()
+                .select_related('creator')
+                .filter(shash=token_hash)
+                .first()
+            )
+            if (
+                not link
+                or link.is_used
+                or link.is_expired
+                or link.expires_at <= timezone.now()
+            ):
+                if link and not link.is_used:
+                    link.is_expired = True
+                    link.save(update_fields=['is_expired'])
+                return _share_message(request, '错误', '分享链接不存在或已失效。', status=404)
+            if request.user.id == link.creator_id:
+                return _share_message(request, '错误', '不能领取自己创建的分享链接。', status=403)
+            peer_count = link.peers.count()
+            if not 1 <= peer_count <= MAX_SHARE_PEERS:
+                link.is_expired = True
+                link.save(update_fields=['is_expired'])
+                return _share_message(request, '错误', '分享链接内容无效。', status=400)
+            source_peers = list(
+                link.peers.filter(
+                    profile__owner_id=link.creator_id,
+                )
+                .prefetch_related(
+                    Prefetch(
+                        'tags',
+                        queryset=RustDeskTag.objects.order_by('tag_name'),
+                        to_attr='ordered_tags',
+                    )
+                )
+                .order_by('pk')
+            )
+            if len(source_peers) != peer_count:
+                link.is_expired = True
+                link.save(update_fields=['is_expired'])
+                return _share_message(request, '错误', '分享链接内容无效。', status=400)
+            personal_profile = _ensure_personal_profile(request.user)
+            AddressBookProfile.objects.select_for_update().get(
+                pk=personal_profile.pk,
+            )
+            existing_ids = set(
+                RustDeskPeer.objects.filter(
+                    profile=personal_profile,
+                    rid__in=[peer.rid for peer in source_peers],
+                ).values_list('rid', flat=True)
+            )
+            sources_to_import = [
+                peer for peer in source_peers if peer.rid not in existing_ids
+            ]
+            recipient_peer_count = RustDeskPeer.objects.filter(
+                profile=personal_profile,
+            ).count()
+            if recipient_peer_count + len(sources_to_import) > MAX_AB_PEERS:
+                return _share_message(
+                    request,
+                    '错误',
+                    '个人地址簿设备数量已达到上限。',
+                    status=409,
+                )
+            source_tag_names = list(
+                dict.fromkeys(
+                    tag_name
+                    for peer in sources_to_import
+                    for tag_name in _peer_tag_list(peer)
+                )
+            )
+            recipient_tags = _resolve_profile_tags(
+                personal_profile,
+                source_tag_names,
+            )
+            if recipient_tags is None:
+                return _share_message(
+                    request,
+                    '错误',
+                    '个人地址簿标签数量已达到上限。',
+                    status=409,
+                )
+            tags_by_name = {
+                tag.tag_name: tag for tag in recipient_tags
+            }
+            imports = []
+            for source in sources_to_import:
+                peer = RustDeskPeer.objects.create(
+                    profile=personal_profile,
+                    rid=source.rid,
+                    username=source.username,
+                    hostname=source.hostname,
+                    alias=source.alias,
+                    platform=source.platform,
+                    rhash=source.rhash,
+                    note=source.note,
+                    password='',
+                    device_group_name=source.device_group_name,
+                    login_name=source.login_name,
+                    same_server=source.same_server,
+                )
+                peer.tags.set(
+                    [
+                        tags_by_name[name]
+                        for name in _peer_tag_list(source)
+                    ]
+                )
+                imports.append(peer)
+            link.is_used = True
+            link.used_at = timezone.now()
+            link.used_by = request.user
+            link.save(update_fields=['is_used', 'used_at', 'used_by'])
+        _log_event(
+            request,
+            'front_share_accept',
+            username=request.user.username,
+            token_prefix=link.token_prefix,
+            imported=len(imports),
+        )
+        return _share_message(
+            request,
+            '成功',
+            f'已获取 {len(imports)} 台设备；已存在的设备不会被覆盖。',
+        )
 
-    user_map = {}
+    if request.method not in ('GET', 'POST'):
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
     if is_admin:
-        user_ids = {str(p.uid) for p in peers_qs}
-        user_ids.update({str(s.uid) for s in sharelinks_qs})
-        if user_ids:
-            for user in UserProfile.objects.filter(Q(id__in=user_ids)):
-                user_map[str(user.id)] = user.username
+        peers_qs = RustDeskPeer.objects.select_related(
+            'profile__owner',
+        ).order_by('profile__owner__username', 'rid', 'pk')
+        sharelinks_qs = ShareLink.objects.select_related('creator').filter(
+            is_used=False,
+            is_expired=False,
+            expires_at__gt=now,
+        ).annotate(peer_count_value=Count('peers'))
+    else:
+        peers_qs = RustDeskPeer.objects.filter(
+            profile__owner=request.user,
+        ).select_related('profile__owner').order_by('rid', 'pk')
+        sharelinks_qs = ShareLink.objects.select_related('creator').filter(
+            creator=request.user,
+            is_used=False,
+            is_expired=False,
+            expires_at__gt=now,
+        ).annotate(peer_count_value=Count('peers'))
 
     peers = []
-    for ix, p in enumerate(peers_qs):
-        owner = user_map.get(str(p.uid), p.uid) if is_admin else None
+    for p in peers_qs:
+        owner = p.profile.owner.username if is_admin else None
         if is_admin:
-            peers.append({'id': ix + 1, 'name': f'{p.rid}|{p.alias}|{owner}'})
+            peers.append({'id': str(p.pk), 'name': f'{p.rid}|{p.alias}|{owner}'})
         else:
-            peers.append({'id': ix + 1, 'name': f'{p.rid}|{p.alias}'})
+            peers.append({'id': str(p.pk), 'name': f'{p.rid}|{p.alias}'})
 
     sharelinks = []
     for s in sharelinks_qs:
-        owner = user_map.get(str(s.uid), s.uid) if is_admin else None
+        owner = s.creator.username if is_admin else None
         row = {
-            'shash': s.shash,
+            'token_prefix': s.token_prefix,
             'is_used': s.is_used,
             'is_expired': s.is_expired,
             'create_time': s.create_time,
-            'peers': s.peers,
+            'expires_at': s.expires_at,
+            'peer_count': s.peer_count_value,
         }
         if is_admin:
             row['owner'] = owner
         sharelinks.append(row)
 
     if request.method == 'GET':
-        url = request.build_absolute_uri()
-        if url.endswith('share'):
-            _log_event(request, 'front_share_view', username=request.user.username)
-            return render(
-                request,
-                'share.html',
-                {'peers': peers, 'sharelinks': sharelinks, 'u': request.user, 'nav_active': 'share', 'is_admin': is_admin},
-            )
-        else:
-            shash = url.split('/')[-1]
-            sharelink = ShareLink.objects.filter(Q(shash=shash))
-            msg = ''
-            title = '成功'
-            if not sharelink:
-                title = '错误'
-                msg = f'链接{url}:<br>分享链接不存在或已失效。'
-            else:
-                sharelink = sharelink[0]
-                if str(request.user.id) == str(sharelink.uid):
-                    title = '错误'
-                    msg = f'链接{url}:<br><br>咱就说，你不能把链接分享给自己吧？！'
-                else:
-                    sharelink.is_used = True
-                    sharelink.save()
-                    peers = sharelink.peers
-                    peers = peers.split(',')
-                    # 自己的peers若重叠，需要跳过
-                    peers_self_ids = [x.rid for x in RustDeskPeer.objects.filter(Q(uid=request.user.id))]
-                    peers_share = RustDeskPeer.objects.filter(Q(rid__in=peers) & Q(uid=sharelink.uid))
-                    # peers_share_ids = [x.rid for x in peers_share]
-
-                    for peer in peers_share:
-                        if peer.rid in peers_self_ids:
-                            continue
-                        # peer = RustDeskPeer.objects.get(rid=peer.rid)
-                        peer_f = RustDeskPeer.objects.filter(Q(rid=peer.rid) & Q(uid=sharelink.uid))
-                        if not peer_f:
-                            msg += f"{peer.rid}已存在,"
-                            continue
-
-                        if len(peer_f) > 1:
-                            msg += f'{peer.rid}存在多个,已经跳过。 '
-                            continue
-                        peer = peer_f[0]
-                        peer.id = None
-                        peer.uid = request.user.id
-                        peer.save()
-                        msg += f"{peer.rid},"
-
-                    msg += '已被成功获取。'
-
-            title = _(title)
-            msg = _(msg)
-            _log_event(request, 'front_share_accept', username=request.user.username, shash=shash, status=title)
-            return render(
-                request,
-                'msg.html',
-                {'title': title, 'msg': msg, 'u': request.user, 'nav_active': 'share'},
-            )
+        _log_event(request, 'front_share_view', username=request.user.username)
+        return render(
+            request,
+            'share.html',
+            {'peers': peers, 'sharelinks': sharelinks, 'u': request.user, 'nav_active': 'share', 'is_admin': is_admin},
+        )
     else:
         data = request.POST.get('data', '[]')
         try:
@@ -887,18 +1300,25 @@ def share(request):
         if not data:
             _log_event(request, 'front_share_create_failed', level="warning", username=request.user.username, reason='empty_data')
             return JsonResponse({'code': 0, 'msg': _('数据为空。')})
-        rustdesk_ids = [x['title'].split('|')[0] for x in data]
-        rustdesk_ids = [rid for rid in rustdesk_ids if rid]
-        if not rustdesk_ids:
+        if not isinstance(data, list) or not 1 <= len(data) <= MAX_SHARE_PEERS:
+            return JsonResponse({'code': 0, 'msg': _('一次最多分享 20 台设备。')}, status=400)
+        selected_keys = {
+            str(item.get('value', '')).strip()
+            for item in data
+            if isinstance(item, dict)
+        }
+        if len(selected_keys) != len(data) or any(not key.isdigit() for key in selected_keys):
             _log_event(request, 'front_share_create_failed', level="warning", username=request.user.username, reason='empty_ids')
-            return JsonResponse({'code': 0, 'msg': _('数据为空。')})
+            return JsonResponse({'code': 0, 'msg': _('设备选择无效。')}, status=400)
 
         share_uid = request.user.id
+        selected_peers = RustDeskPeer.objects.filter(pk__in=selected_keys)
         if is_admin:
             owner_ids = list(
-                RustDeskPeer.objects.filter(Q(rid__in=rustdesk_ids))
-                .values_list('uid', flat=True)
-                .distinct()
+                selected_peers.values_list(
+                    'profile__owner_id',
+                    flat=True,
+                ).distinct()
             )
             if not owner_ids:
                 _log_event(request, 'front_share_create_failed', level="warning", username=request.user.username, reason='owner_missing')
@@ -908,21 +1328,44 @@ def share(request):
                 return JsonResponse({'code': 0, 'msg': _('请选择同一用户的设备进行分享。')})
             share_uid = owner_ids[0]
         else:
-            own_count = RustDeskPeer.objects.filter(Q(rid__in=rustdesk_ids) & Q(uid=request.user.id)).count()
-            if own_count != len(set(rustdesk_ids)):
+            selected_peers = selected_peers.filter(profile__owner=request.user)
+            if selected_peers.count() != len(selected_keys):
                 _log_event(request, 'front_share_create_failed', level="warning", username=request.user.username, reason='invalid_owner')
-                return JsonResponse({'code': 0, 'msg': _('仅支持分享自己名下的设备。')})
+                return JsonResponse({'code': 0, 'msg': _('仅支持分享自己名下的设备。')}, status=403)
 
-        rustdesk_ids = ','.join(rustdesk_ids)
-        sharelink = ShareLink(
-            uid=share_uid,
-            shash=secrets.token_urlsafe(24),
-            peers=rustdesk_ids,
-        )
-        sharelink.save()
-        _log_event(request, 'front_share_create', username=request.user.username, count=len(rustdesk_ids.split(',')))
+        selected_peer_keys = list(selected_peers.order_by('pk').values_list('pk', flat=True))
+        if len(selected_peer_keys) != len(selected_keys):
+            return JsonResponse({'code': 0, 'msg': _('设备选择无效。')}, status=400)
+        with transaction.atomic():
+            source_user = UserProfile.objects.select_for_update().filter(
+                pk=share_uid,
+                is_active=True,
+            ).first()
+            if not source_user:
+                return JsonResponse(
+                    {'code': 0, 'msg': _('设备归属用户不存在或已禁用。')},
+                    status=409,
+                )
+            if ShareLink.objects.filter(
+                creator=source_user,
+                is_used=False,
+                is_expired=False,
+                expires_at__gt=timezone.now(),
+            ).count() >= MAX_ACTIVE_SHARE_LINKS:
+                return JsonResponse(
+                    {'code': 0, 'msg': _('有效分享链接数量已达到上限。')},
+                    status=429,
+                )
+            raw_token = secrets.token_urlsafe(32)
+            sharelink = ShareLink.objects.create(
+                creator=source_user,
+                shash=_share_token_hash(raw_token),
+                token_prefix=raw_token[:8],
+            )
+            sharelink.peers.set(selected_peer_keys)
+        _log_event(request, 'front_share_create', username=request.user.username, count=len(selected_peer_keys))
 
-        return JsonResponse({'code': 1, 'shash': sharelink.shash})
+        return JsonResponse({'code': 1, 'token': raw_token, 'expires_at': sharelink.expires_at.isoformat()})
 
 
 @login_required(login_url='/api/user_action?action=login')
@@ -966,7 +1409,7 @@ def ab_manage(request):
             if not user_key:
                 messages.error(request, _('用户不存在。'))
                 return HttpResponseRedirect('/api/ab_manage')
-            target = UserProfile.objects.filter(Q(username=user_key) | Q(id=user_key)).first()
+            target = _find_user(user_key, active_only=True)
             if not target:
                 messages.error(request, _('用户不存在。'))
                 return HttpResponseRedirect('/api/ab_manage')
@@ -989,7 +1432,7 @@ def ab_manage(request):
             if not group_key:
                 messages.error(request, _('用户组不存在。'))
                 return HttpResponseRedirect('/api/ab_manage')
-            group = Group.objects.filter(Q(name=group_key) | Q(id=group_key)).first()
+            group = _find_group(group_key)
             if not group:
                 messages.error(request, _('用户组不存在。'))
                 return HttpResponseRedirect('/api/ab_manage')
@@ -1118,37 +1561,46 @@ def ab_books(request):
     if not u:
         return HttpResponseRedirect('/api/user_action?action=login')
 
-    filter_q = str(request.GET.get('q', '')).strip()
+    filter_q = str(request.GET.get('q', '')).strip()[:200]
 
     if request.method == 'POST':
         action = request.POST.get('action', '')
         if action == 'create_book':
-            name = str(request.POST.get('name', '')).strip()
-            note = str(request.POST.get('note', '')).strip()
+            name = _valid_form_text(
+                request.POST.get('name', ''),
+                max_chars=60,
+                max_bytes=240,
+            )
+            note = _valid_form_text(
+                request.POST.get('note', ''),
+                max_chars=4096,
+                max_bytes=4096,
+                strip=False,
+            )
             owner_key = str(request.POST.get('owner', '')).strip()
-            if not name:
-                messages.error(request, _('地址簿名称不能为空。'))
+            if not name or note is None:
+                messages.error(request, _('地址簿名称或备注格式无效。'))
                 return HttpResponseRedirect('/api/ab_books')
             if _is_reserved_ab_profile_name(name):
                 messages.error(request, _('地址簿名称为保留名称。'))
                 return HttpResponseRedirect('/api/ab_books')
             owner = u
             if u.is_admin and owner_key:
-                owner = UserProfile.objects.filter(Q(username=owner_key) | Q(id=owner_key)).first()
+                owner = _find_user(owner_key, active_only=True)
                 if not owner:
                     messages.error(request, _('目标用户不存在。'))
                     return HttpResponseRedirect('/api/ab_books')
-            if AddressBookProfile.objects.filter(Q(owner=owner) & Q(name=name)).exists():
+            try:
+                profile = AddressBookProfile.objects.create(
+                    guid=uuid.uuid4().hex,
+                    name=name,
+                    owner=owner,
+                    rule=3,
+                    note=note,
+                )
+            except IntegrityError:
                 messages.error(request, _('地址簿名称已存在。'))
                 return HttpResponseRedirect('/api/ab_books')
-            profile = AddressBookProfile(
-                guid=uuid.uuid4().hex,
-                name=name,
-                owner=owner,
-                rule=3,
-                note=note or '',
-            )
-            profile.save()
             _log_event(request, 'front_ab_book_create', username=u.username, guid=profile.guid, owner=owner.username)
             messages.success(request, _('地址簿已创建。'))
             return HttpResponseRedirect('/api/ab_books')
@@ -1165,9 +1617,21 @@ def ab_books(request):
             if not u.is_admin and str(profile.owner_id) != str(u.id):
                 messages.error(request, _('无权限操作该地址簿。'))
                 return HttpResponseRedirect('/api/ab_books')
-            name = str(request.POST.get('name', '')).strip()
-            note = str(request.POST.get('note', '')).strip()
-            if name and name != profile.name:
+            name = _valid_form_text(
+                request.POST.get('name', ''),
+                max_chars=60,
+                max_bytes=240,
+            )
+            note = _valid_form_text(
+                request.POST.get('note', ''),
+                max_chars=4096,
+                max_bytes=4096,
+                strip=False,
+            )
+            if not name or note is None:
+                messages.error(request, _('地址簿名称或备注格式无效。'))
+                return HttpResponseRedirect('/api/ab_books')
+            if name != profile.name:
                 if _is_reserved_ab_profile_name(name):
                     messages.error(request, _('地址簿名称为保留名称。'))
                     return HttpResponseRedirect('/api/ab_books')
@@ -1175,9 +1639,12 @@ def ab_books(request):
                     messages.error(request, _('地址簿名称已存在。'))
                     return HttpResponseRedirect('/api/ab_books')
                 profile.name = name
-            if note is not None:
-                profile.note = note
-            profile.save()
+            profile.note = note
+            try:
+                profile.save()
+            except IntegrityError:
+                messages.error(request, _('地址簿名称已存在。'))
+                return HttpResponseRedirect('/api/ab_books')
             _log_event(request, 'front_ab_book_update', username=u.username, guid=profile.guid)
             messages.success(request, _('地址簿已更新。'))
             return HttpResponseRedirect('/api/ab_books')
@@ -1194,10 +1661,6 @@ def ab_books(request):
             if not u.is_admin and str(profile.owner_id) != str(u.id):
                 messages.error(request, _('无权限操作该地址簿。'))
                 return HttpResponseRedirect('/api/ab_books')
-            RustDeskPeer.objects.filter(Q(uid=profile.owner_id) & Q(profile_guid=guid)).delete()
-            RustDeskTag.objects.filter(Q(uid=profile.owner_id) & Q(profile_guid=guid)).delete()
-            AddressBookRule.objects.filter(Q(profile=profile)).delete()
-            AddressBookShare.objects.filter(Q(profile=profile)).delete()
             profile.delete()
             _log_event(request, 'front_ab_book_delete', username=u.username, guid=guid)
             messages.success(request, _('地址簿已删除。'))
@@ -1219,16 +1682,31 @@ def ab_books(request):
             if not target_key:
                 messages.error(request, _('目标用户不存在。'))
                 return HttpResponseRedirect('/api/ab_books')
-            new_owner = UserProfile.objects.filter(Q(username=target_key) | Q(id=target_key)).first()
+            new_owner = _find_user(target_key, active_only=True)
             if not new_owner:
                 messages.error(request, _('目标用户不存在。'))
                 return HttpResponseRedirect('/api/ab_books')
-            old_owner_id = profile.owner_id
-            if str(old_owner_id) != str(new_owner.id):
-                profile.owner = new_owner
-                profile.save(update_fields=['owner', 'updated_at'])
-                RustDeskPeer.objects.filter(Q(uid=str(old_owner_id)) & Q(profile_guid=profile.guid)).update(uid=str(new_owner.id))
-                RustDeskTag.objects.filter(Q(uid=str(old_owner_id)) & Q(profile_guid=profile.guid)).update(uid=str(new_owner.id))
+            if str(profile.owner_id) != str(new_owner.id):
+                if AddressBookProfile.objects.filter(
+                    owner=new_owner,
+                    name=profile.name,
+                ).exclude(pk=profile.pk).exists():
+                    messages.error(request, _('目标用户已有同名地址簿。'))
+                    return HttpResponseRedirect('/api/ab_books')
+                try:
+                    with transaction.atomic():
+                        profile = AddressBookProfile.objects.select_for_update().get(
+                            pk=profile.pk
+                        )
+                        profile.owner = new_owner
+                        profile.save(update_fields=['owner', 'updated_at'])
+                        AddressBookShare.objects.filter(
+                            profile=profile,
+                            user=new_owner,
+                        ).delete()
+                except IntegrityError:
+                    messages.error(request, _('目标用户已有同名地址簿。'))
+                    return HttpResponseRedirect('/api/ab_books')
             _log_event(request, 'front_ab_book_transfer', username=u.username, guid=profile.guid, owner=new_owner.username)
             messages.success(request, _('地址簿已更新。'))
             return HttpResponseRedirect('/api/ab_books')
@@ -1238,8 +1716,8 @@ def ab_books(request):
     profiles = []
     for profile in profiles_qs.order_by('name'):
         is_personal = _is_personal_guid(profile.guid)
-        peers_count = RustDeskPeer.objects.filter(Q(uid=profile.owner_id) & Q(profile_guid=profile.guid)).count()
-        tags_count = RustDeskTag.objects.filter(Q(uid=profile.owner_id) & Q(profile_guid=profile.guid)).count()
+        peers_count = profile.peers.count()
+        tags_count = profile.tags.count()
         access_rule = 3 if (u.is_admin or str(profile.owner_id) == str(u.id)) else _get_rule_access(profile, u)
         can_edit = u.is_admin or str(profile.owner_id) == str(u.id) or _can_write_rule(access_rule)
         profiles.append({
@@ -1282,8 +1760,8 @@ def ab_books_export(request):
     if export_format in ('xls', 'xlsx'):
         rows = []
         for profile in profiles:
-            peers_count = RustDeskPeer.objects.filter(Q(uid=profile.owner_id) & Q(profile_guid=profile.guid)).count()
-            tags_count = RustDeskTag.objects.filter(Q(uid=profile.owner_id) & Q(profile_guid=profile.guid)).count()
+            peers_count = profile.peers.count()
+            tags_count = profile.tags.count()
             rows.append([
                 profile.name,
                 profile.guid,
@@ -1297,11 +1775,11 @@ def ab_books_export(request):
         return response
 
     output = StringIO()
-    writer = csv.writer(output)
+    writer = safe_csv_writer(output)
     writer.writerow(headers)
     for profile in profiles:
-        peers_count = RustDeskPeer.objects.filter(Q(uid=profile.owner_id) & Q(profile_guid=profile.guid)).count()
-        tags_count = RustDeskTag.objects.filter(Q(uid=profile.owner_id) & Q(profile_guid=profile.guid)).count()
+        peers_count = profile.peers.count()
+        tags_count = profile.tags.count()
         writer.writerow([
             profile.name,
             profile.guid,
@@ -1347,40 +1825,73 @@ def ab_book(request):
         if action in ('bulk_tag_add', 'bulk_tag_remove', 'bulk_tag_replace', 'bulk_note_update', 'bulk_peer_delete'):
             peer_ids = request.POST.getlist('peer_ids')
             tags_input = request.POST.get('tags', '')
-            tags = _normalize_tags(tags_input)
-            if not peer_ids:
+            tags = _valid_tags(tags_input)
+            if (
+                not peer_ids
+                or len(peer_ids) > 500
+                or any(_valid_peer_id(peer_id) != peer_id for peer_id in peer_ids)
+                or tags is None
+            ):
                 messages.error(request, _('请选择至少一台设备。'))
                 return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
-            peers_qs = RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid) & Q(rid__in=peer_ids))
+            peers_qs = RustDeskPeer.objects.filter(
+                profile=profile,
+                rid__in=peer_ids,
+            )
             updated = 0
             if action in ('bulk_tag_add', 'bulk_tag_remove', 'bulk_tag_replace'):
-                for peer in peers_qs:
-                    existing = _normalize_tags(peer.tags)
-                    if action == 'bulk_tag_add':
-                        new_tags = existing[:]
-                        for tag in tags:
-                            if tag not in new_tags:
-                                new_tags.append(tag)
-                    elif action == 'bulk_tag_remove':
-                        new_tags = [t for t in existing if t not in tags]
-                    else:
-                        new_tags = tags[:]
-                    peer.tags = ','.join(new_tags)
-                    peer.save()
-                    updated += 1
-                    for tag_name in new_tags:
-                        if not RustDeskTag.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid) & Q(tag_name=tag_name)).exists():
-                            RustDeskTag(uid=owner.id, tag_name=tag_name, tag_color='', profile_guid=profile.guid).save()
+                with transaction.atomic():
+                    AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+                    peers = list(
+                        peers_qs.select_for_update().prefetch_related('tags')
+                    )
+                    tags_by_peer = {}
+                    required_tags = set()
+                    for peer in peers:
+                        existing = _peer_tag_list(peer)
+                        if action == 'bulk_tag_add':
+                            new_tags = list(dict.fromkeys([*existing, *tags]))
+                        elif action == 'bulk_tag_remove':
+                            new_tags = [tag for tag in existing if tag not in tags]
+                        else:
+                            new_tags = tags[:]
+                        if len(new_tags) > MAX_AB_TAGS_PER_PEER:
+                            messages.error(request, _('每台设备最多支持 32 个标签。'))
+                            return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
+                        tags_by_peer[peer.pk] = new_tags
+                        required_tags.update(new_tags)
+                    resolved_tags = _resolve_profile_tags(
+                        profile,
+                        required_tags,
+                    )
+                    if resolved_tags is None:
+                        messages.error(request, _('地址簿标签数量已达到上限。'))
+                        return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
+                    tags_by_name = {
+                        tag.tag_name: tag for tag in resolved_tags
+                    }
+                    for peer in peers:
+                        peer.tags.set(
+                            [
+                                tags_by_name[name]
+                                for name in tags_by_peer[peer.pk]
+                            ]
+                        )
+                    updated = len(peers)
                 _log_event(request, 'front_ab_bulk_tag', username=u.username, guid=profile.guid, action=action, count=updated)
                 messages.success(request, _('已批量更新 %(count)s 台设备标签。') % {'count': updated})
                 return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
 
             if action == 'bulk_note_update':
-                note_value = str(request.POST.get('note', '')).strip()
-                for peer in peers_qs:
-                    peer.note = note_value
-                    peer.save()
-                    updated += 1
+                note_value = _valid_form_text(
+                    request.POST.get('note', ''),
+                    max_chars=4096,
+                    max_bytes=4096,
+                )
+                if note_value is None:
+                    messages.error(request, _('备注内容过长或格式无效。'))
+                    return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
+                updated = peers_qs.update(note=note_value)
                 _log_event(request, 'front_ab_bulk_note', username=u.username, guid=profile.guid, count=updated)
                 messages.success(request, _('已批量更新 %(count)s 台设备备注。') % {'count': updated})
                 return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
@@ -1393,145 +1904,168 @@ def ab_book(request):
                 return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
 
         if action == 'add_tag':
-            name = str(request.POST.get('name', '')).strip()
-            color = str(request.POST.get('color', '')).strip()
-            if not name:
-                messages.error(request, _('标签名称不能为空。'))
+            name = _valid_tag_name(request.POST.get('name', ''))
+            color = normalize_tag_color(request.POST.get('color', ''))
+            if name is None or color is None:
+                messages.error(request, _('标签名称或颜色格式无效。'))
                 return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
-            if not RustDeskTag.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid) & Q(tag_name=name)).first():
-                RustDeskTag(uid=owner.id, tag_name=name, tag_color=color, profile_guid=profile.guid).save()
-            else:
-                RustDeskTag.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid) & Q(tag_name=name)).update(tag_color=color)
+            if not _upsert_tag(profile, name, color):
+                messages.error(request, _('地址簿标签数量已达到上限。'))
+                return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
             _log_event(request, 'front_ab_tag_add', username=u.username, guid=profile.guid, tag=name)
             messages.success(request, _('标签已更新。'))
             return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
 
         if action == 'rename_tag':
-            old = str(request.POST.get('old', '')).strip()
-            new = str(request.POST.get('new', '')).strip()
-            if not old or not new:
-                messages.error(request, _('标签名称不能为空。'))
+            old = _valid_tag_name(request.POST.get('old', ''))
+            new = _valid_tag_name(request.POST.get('new', ''))
+            if old is None or new is None:
+                messages.error(request, _('标签名称无效。'))
                 return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
-            RustDeskTag.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid) & Q(tag_name=old)).update(tag_name=new)
-            peers = RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid))
-            for peer in peers:
-                tags = [x for x in peer.tags.split(',') if x]
-                if old in tags:
-                    tags = [new if x == old else x for x in tags]
-                    peer.tags = ','.join(tags)
-                    peer.save()
+            if not _rename_tag(profile, old, new):
+                messages.error(request, _('标签不存在。'))
+                return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
             _log_event(request, 'front_ab_tag_rename', username=u.username, guid=profile.guid, old=old, new=new)
             messages.success(request, _('标签已重命名。'))
             return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
 
         if action == 'update_tag':
-            name = str(request.POST.get('name', '')).strip()
-            color = str(request.POST.get('color', '')).strip()
-            if not name:
-                messages.error(request, _('标签名称不能为空。'))
+            name = _valid_tag_name(request.POST.get('name', ''))
+            color = normalize_tag_color(request.POST.get('color', ''))
+            if name is None or color is None:
+                messages.error(request, _('标签名称或颜色格式无效。'))
                 return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
-            RustDeskTag.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid) & Q(tag_name=name)).update(tag_color=color)
+            if not _upsert_tag(profile, name, color):
+                messages.error(request, _('地址簿标签数量已达到上限。'))
+                return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
             _log_event(request, 'front_ab_tag_update', username=u.username, guid=profile.guid, tag=name)
             messages.success(request, _('标签颜色已更新。'))
             return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
 
         if action == 'delete_tag':
-            name = str(request.POST.get('name', '')).strip()
-            if not name:
-                messages.error(request, _('标签名称不能为空。'))
+            name = _valid_tag_name(request.POST.get('name', ''))
+            if name is None:
+                messages.error(request, _('标签名称无效。'))
                 return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
-            RustDeskTag.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid) & Q(tag_name=name)).delete()
-            peers = RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid))
-            for peer in peers:
-                tags = [x for x in peer.tags.split(',') if x and x != name]
-                peer.tags = ','.join(tags)
-                peer.save()
+            _delete_tag(profile, name)
             _log_event(request, 'front_ab_tag_delete', username=u.username, guid=profile.guid, tag=name)
             messages.success(request, _('标签已删除。'))
             return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
 
         if action == 'add_peer':
-            rid = str(request.POST.get('rid', '')).strip()
-            alias = str(request.POST.get('alias', '')).strip()
-            note = str(request.POST.get('note', '')).strip()
-            tags = _normalize_tags(request.POST.get('tags', ''))
-            password = str(request.POST.get('password', '')).strip()
-            if not rid:
-                messages.error(request, _('设备ID不能为空。'))
+            peer_data = _peer_form_payload(request.POST)
+            if peer_data is None:
+                messages.error(request, _('设备信息格式无效或超过长度限制。'))
                 return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
-            peer = RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(rid=rid) & Q(profile_guid=profile.guid)).first()
-            tags_str = ','.join(tags)
-            if peer:
-                peer.alias = alias or peer.alias
-                peer.note = note
-                peer.tags = tags_str
-                if not is_personal and password:
-                    peer.password = password
-                peer.save()
-                _log_event(request, 'front_ab_peer_update', username=u.username, guid=profile.guid, rid=rid)
-                messages.success(request, _('设备已更新。'))
-            else:
-                peer = RustDeskPeer(
-                    uid=str(owner.id),
+            rid = peer_data['rid']
+            with transaction.atomic():
+                AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+                peer = RustDeskPeer.objects.filter(
+                    profile=profile,
                     rid=rid,
-                    username='',
-                    hostname='',
-                    alias=alias or rid,
-                    platform='',
-                    tags=tags_str,
-                    rhash='',
-                    note=note or '',
-                    password='' if is_personal else password,
-                    device_group_name='',
-                    login_name='',
-                    same_server=False,
-                    profile_guid=profile.guid,
+                ).first()
+                if (
+                    not peer
+                    and RustDeskPeer.objects.filter(
+                        profile=profile,
+                    ).count() >= 10_000
+                ):
+                    messages.error(request, _('地址簿设备数量已达到上限。'))
+                    return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
+                resolved_tags = _resolve_profile_tags(
+                    profile,
+                    peer_data['tags'],
                 )
-                peer.save()
-                _log_event(request, 'front_ab_peer_add', username=u.username, guid=profile.guid, rid=rid)
-                messages.success(request, _('设备已新增。'))
-            for tag_name in tags:
-                if not RustDeskTag.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid) & Q(tag_name=tag_name)).exists():
-                    RustDeskTag(uid=owner.id, tag_name=tag_name, tag_color='', profile_guid=profile.guid).save()
+                if resolved_tags is None:
+                    messages.error(request, _('地址簿标签数量已达到上限。'))
+                    return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
+                if peer:
+                    peer.alias = peer_data['alias'] or peer.alias
+                    peer.note = peer_data['note']
+                    if not is_personal and peer_data['password']:
+                        peer.password = peer_data['password']
+                    peer.save()
+                    event = 'front_ab_peer_update'
+                    success_message = _('设备已更新。')
+                else:
+                    peer = RustDeskPeer.objects.create(
+                        profile=profile,
+                        rid=rid,
+                        username='',
+                        hostname='',
+                        alias=peer_data['alias'] or rid,
+                        platform='',
+                        rhash='',
+                        note=peer_data['note'],
+                        password=(
+                            ''
+                            if is_personal
+                            else peer_data['password']
+                        ),
+                        device_group_name='',
+                        login_name='',
+                        same_server=False,
+                    )
+                    event = 'front_ab_peer_add'
+                    success_message = _('设备已新增。')
+                peer.tags.set(resolved_tags)
+            _log_event(request, event, username=u.username, guid=profile.guid, rid=rid)
+            messages.success(request, success_message)
             return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
 
         if action == 'update_peer':
-            rid = str(request.POST.get('rid', '')).strip()
-            alias = str(request.POST.get('alias', '')).strip()
-            note = str(request.POST.get('note', '')).strip()
-            tags = _normalize_tags(request.POST.get('tags', ''))
-            password = str(request.POST.get('password', '')).strip()
-            if not rid:
-                messages.error(request, _('设备ID不能为空。'))
+            peer_data = _peer_form_payload(request.POST)
+            if peer_data is None:
+                messages.error(request, _('设备信息格式无效或超过长度限制。'))
                 return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
-            peer = RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(rid=rid) & Q(profile_guid=profile.guid)).first()
-            if not peer:
-                messages.error(request, _('设备不存在。'))
-                return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
-            peer.alias = alias or peer.alias
-            peer.note = note
-            peer.tags = ','.join(tags)
-            if not is_personal and password:
-                peer.password = password
-            peer.save()
-            for tag_name in tags:
-                if not RustDeskTag.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid) & Q(tag_name=tag_name)).exists():
-                    RustDeskTag(uid=owner.id, tag_name=tag_name, tag_color='', profile_guid=profile.guid).save()
+            rid = peer_data['rid']
+            with transaction.atomic():
+                AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+                peer = RustDeskPeer.objects.select_for_update().filter(
+                    profile=profile,
+                    rid=rid,
+                ).first()
+                if not peer:
+                    messages.error(request, _('设备不存在。'))
+                    return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
+                resolved_tags = _resolve_profile_tags(
+                    profile,
+                    peer_data['tags'],
+                )
+                if resolved_tags is None:
+                    messages.error(request, _('地址簿标签数量已达到上限。'))
+                    return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
+                peer.alias = peer_data['alias'] or peer.alias
+                peer.note = peer_data['note']
+                if not is_personal and peer_data['password']:
+                    peer.password = peer_data['password']
+                peer.save()
+                peer.tags.set(resolved_tags)
             _log_event(request, 'front_ab_peer_update', username=u.username, guid=profile.guid, rid=rid)
             messages.success(request, _('设备已更新。'))
             return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
 
         if action == 'delete_peer':
-            rid = str(request.POST.get('rid', '')).strip()
-            if not rid:
-                messages.error(request, _('设备ID不能为空。'))
+            rid = _valid_peer_id(request.POST.get('rid', ''))
+            if rid is None:
+                messages.error(request, _('设备 ID 格式无效。'))
                 return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
-            RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid) & Q(rid=rid)).delete()
+            RustDeskPeer.objects.filter(profile=profile, rid=rid).delete()
             _log_event(request, 'front_ab_peer_delete', username=u.username, guid=profile.guid, rid=rid)
             messages.success(request, _('设备已删除。'))
             return HttpResponseRedirect(f'/api/ab_book?guid={profile.guid}')
 
-    peers = list(RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid)))
+    peers = list(
+        RustDeskPeer.objects.filter(profile=profile).prefetch_related(
+            Prefetch(
+                'tags',
+                queryset=RustDeskTag.objects.order_by('tag_name'),
+                to_attr='ordered_tags',
+            )
+        )
+    )
+    for peer in peers:
+        peer.tag_names = _peer_tag_text(peer)
     peers.sort(key=lambda x: x.rid)
 
     return render(
@@ -1566,7 +2100,7 @@ def ab_book_export(request):
 
     filename_stamp = _filename_stamp()
     if kind == 'tags':
-        rows = list(RustDeskTag.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid)))
+        rows = list(RustDeskTag.objects.filter(profile=profile))
         headers = [_('标签名称'), _('颜色')]
         if export_format in ('xls', 'xlsx'):
             response = xlsx_response(
@@ -1578,7 +2112,7 @@ def ab_book_export(request):
             _log_event(request, 'front_ab_book_export', username=u.username, guid=profile.guid, kind='tags')
             return response
         output = StringIO()
-        writer = csv.writer(output)
+        writer = safe_csv_writer(output)
         writer.writerow(headers)
         for tag in rows:
             writer.writerow([tag.tag_name, tag.tag_color])
@@ -1587,7 +2121,15 @@ def ab_book_export(request):
         _log_event(request, 'front_ab_book_export', username=u.username, guid=profile.guid, kind='tags')
         return response
 
-    rows = list(RustDeskPeer.objects.filter(Q(uid=owner.id) & Q(profile_guid=profile.guid)))
+    rows = list(
+        RustDeskPeer.objects.filter(profile=profile).prefetch_related(
+            Prefetch(
+                'tags',
+                queryset=RustDeskTag.objects.order_by('tag_name'),
+                to_attr='ordered_tags',
+            )
+        )
+    )
     headers = [_('设备ID'), _('别名'), _('备注'), _('标签'), _('共享密码（可选）')]
     if export_format in ('xls', 'xlsx'):
         response = xlsx_response(
@@ -1599,7 +2141,7 @@ def ab_book_export(request):
                     peer.rid,
                     peer.alias,
                     peer.note or '',
-                    peer.tags,
+                    _peer_tag_text(peer),
                     peer.password if not _is_personal_guid(profile.guid) else '',
                 ]
                 for peer in rows
@@ -1609,14 +2151,14 @@ def ab_book_export(request):
         return response
 
     output = StringIO()
-    writer = csv.writer(output)
+    writer = safe_csv_writer(output)
     writer.writerow(headers)
     for peer in rows:
         writer.writerow([
             peer.rid,
             peer.alias,
             peer.note or '',
-            peer.tags,
+            _peer_tag_text(peer),
             peer.password if not _is_personal_guid(profile.guid) else '',
         ])
     response = HttpResponse(output.getvalue(), content_type='text/csv; charset=utf-8')
@@ -1654,88 +2196,76 @@ def tag_manage(request):
             return HttpResponseRedirect('/api/tag_manage')
 
         if action == 'add_tag':
-            name = str(request.POST.get('name', '')).strip()
-            color = str(request.POST.get('color', '')).strip()
-            if not name:
-                messages.error(request, _('标签名称不能为空。'))
+            name = _valid_tag_name(request.POST.get('name', ''))
+            color = normalize_tag_color(request.POST.get('color', ''))
+            if name is None or color is None:
+                messages.error(request, _('标签名称或颜色格式无效。'))
                 return HttpResponseRedirect('/api/tag_manage')
-            tag = RustDeskTag.objects.filter(Q(uid=target_profile.owner_id) & Q(profile_guid=profile_guid) & Q(tag_name=name)).first()
-            if tag:
-                tag.tag_color = color
-                tag.save()
-            else:
-                RustDeskTag(uid=target_profile.owner_id, tag_name=name, tag_color=color, profile_guid=profile_guid).save()
+            if not _upsert_tag(target_profile, name, color):
+                messages.error(request, _('地址簿标签数量已达到上限。'))
+                return HttpResponseRedirect('/api/tag_manage')
             _log_event(request, 'front_tag_add', username=u.username, guid=profile_guid, tag=name)
             messages.success(request, _('标签已更新。'))
             return HttpResponseRedirect('/api/tag_manage')
 
         if action == 'update_tag':
-            name = str(request.POST.get('name', '')).strip()
-            color = str(request.POST.get('color', '')).strip()
-            if not name:
-                messages.error(request, _('标签名称不能为空。'))
+            name = _valid_tag_name(request.POST.get('name', ''))
+            color = normalize_tag_color(request.POST.get('color', ''))
+            if name is None or color is None:
+                messages.error(request, _('标签名称或颜色格式无效。'))
                 return HttpResponseRedirect('/api/tag_manage')
-            RustDeskTag.objects.filter(Q(uid=target_profile.owner_id) & Q(profile_guid=profile_guid) & Q(tag_name=name)).update(tag_color=color)
+            if not _upsert_tag(target_profile, name, color):
+                messages.error(request, _('地址簿标签数量已达到上限。'))
+                return HttpResponseRedirect('/api/tag_manage')
             _log_event(request, 'front_tag_update', username=u.username, guid=profile_guid, tag=name)
             messages.success(request, _('标签颜色已更新。'))
             return HttpResponseRedirect('/api/tag_manage')
 
         if action == 'rename_tag':
-            old = str(request.POST.get('old', '')).strip()
-            new = str(request.POST.get('new', '')).strip()
-            if not old or not new:
-                messages.error(request, _('标签名称不能为空。'))
+            old = _valid_tag_name(request.POST.get('old', ''))
+            new = _valid_tag_name(request.POST.get('new', ''))
+            if old is None or new is None:
+                messages.error(request, _('标签名称无效。'))
                 return HttpResponseRedirect('/api/tag_manage')
             if old == new:
                 messages.success(request, _('标签已重命名。'))
                 return HttpResponseRedirect('/api/tag_manage')
-            existing = RustDeskTag.objects.filter(Q(uid=target_profile.owner_id) & Q(profile_guid=profile_guid) & Q(tag_name=new)).first()
-            if not existing:
-                RustDeskTag.objects.filter(Q(uid=target_profile.owner_id) & Q(profile_guid=profile_guid) & Q(tag_name=old)).update(tag_name=new)
-            peers = RustDeskPeer.objects.filter(Q(uid=target_profile.owner_id) & Q(profile_guid=profile_guid))
-            for p in peers:
-                tags = [x for x in p.tags.split(',') if x]
-                if old in tags:
-                    tags = [new if x == old else x for x in tags]
-                    p.tags = ','.join(tags)
-                    p.save()
-            if existing:
-                RustDeskTag.objects.filter(Q(uid=target_profile.owner_id) & Q(profile_guid=profile_guid) & Q(tag_name=old)).delete()
+            if not _rename_tag(target_profile, old, new):
+                messages.error(request, _('标签不存在。'))
+                return HttpResponseRedirect('/api/tag_manage')
             _log_event(request, 'front_tag_rename', username=u.username, guid=profile_guid, old=old, new=new)
             messages.success(request, _('标签已重命名。'))
             return HttpResponseRedirect('/api/tag_manage')
 
         if action == 'delete_tag':
-            name = str(request.POST.get('name', '')).strip()
-            if not name:
-                messages.error(request, _('标签名称不能为空。'))
+            name = _valid_tag_name(request.POST.get('name', ''))
+            if name is None:
+                messages.error(request, _('标签名称无效。'))
                 return HttpResponseRedirect('/api/tag_manage')
-            RustDeskTag.objects.filter(Q(uid=target_profile.owner_id) & Q(profile_guid=profile_guid) & Q(tag_name=name)).delete()
-            peers = RustDeskPeer.objects.filter(Q(uid=target_profile.owner_id) & Q(profile_guid=profile_guid))
-            for p in peers:
-                tags = [x for x in p.tags.split(',') if x and x != name]
-                p.tags = ','.join(tags)
-                p.save()
+            _delete_tag(target_profile, name)
             _log_event(request, 'front_tag_delete', username=u.username, guid=profile_guid, tag=name)
             messages.success(request, _('标签已删除。'))
             return HttpResponseRedirect('/api/tag_manage')
 
-    tag_rows = RustDeskTag.objects.filter(profile_guid__in=list(profile_map.keys()))
+    tag_rows = RustDeskTag.objects.filter(
+        profile__guid__in=list(profile_map.keys()),
+    ).select_related('profile__owner')
     if filter_q:
         tag_rows = tag_rows.filter(
             Q(tag_name__icontains=filter_q)
-            | Q(profile_guid__icontains=filter_q)
+            | Q(profile__guid__icontains=filter_q)
         )
     tags = []
     for tag in tag_rows.order_by('tag_name'):
-        profile = profile_map.get(tag.profile_guid)
+        profile = tag.profile
         if not profile:
             continue
         access_rule = 3 if (u.is_admin or str(profile.owner_id) == str(u.id)) else _get_rule_access(profile, u)
         tags.append({
             'name': tag.tag_name,
             'color': tag.tag_color,
-            'profile_guid': tag.profile_guid,
+            'css_color': tag_color_css(tag.tag_color),
+            'profile_guid': profile.guid,
             'profile_name': profile.name,
             'owner': profile.owner.username if profile.owner else '-',
             'can_edit': _can_write_rule(access_rule),
@@ -1764,11 +2294,13 @@ def tag_export(request):
     filter_q = str(request.GET.get('q', '')).strip()
     profiles = list(_ab_accessible_profiles(u, None).select_related('owner'))
     profile_map = {p.guid: p for p in profiles}
-    tags_qs = RustDeskTag.objects.filter(profile_guid__in=list(profile_map.keys()))
+    tags_qs = RustDeskTag.objects.filter(
+        profile__guid__in=list(profile_map.keys()),
+    ).select_related('profile__owner')
     if filter_q:
         tags_qs = tags_qs.filter(
             Q(tag_name__icontains=filter_q)
-            | Q(profile_guid__icontains=filter_q)
+            | Q(profile__guid__icontains=filter_q)
         )
     rows = list(tags_qs.order_by('tag_name'))
     filename_stamp = _filename_stamp()
@@ -1777,12 +2309,12 @@ def tag_export(request):
     if export_format in ('xls', 'xlsx'):
         xlsx_rows = []
         for tag in rows:
-            profile = profile_map.get(tag.profile_guid)
+            profile = tag.profile
             xlsx_rows.append([
                 tag.tag_name,
                 tag.tag_color,
                 profile.name if profile else '',
-                tag.profile_guid,
+                profile.guid if profile else '',
                 profile.owner.username if profile and profile.owner else '-',
             ])
         response = xlsx_response(f'ab_tags_{filename_stamp}.xlsx', _('标签列表'), headers, xlsx_rows)
@@ -1790,15 +2322,15 @@ def tag_export(request):
         return response
 
     output = StringIO()
-    writer = csv.writer(output)
+    writer = safe_csv_writer(output)
     writer.writerow(headers)
     for tag in rows:
-        profile = profile_map.get(tag.profile_guid)
+        profile = tag.profile
         writer.writerow([
             tag.tag_name,
             tag.tag_color,
             profile.name if profile else '',
-            tag.profile_guid,
+            profile.guid if profile else '',
             profile.owner.username if profile and profile.owner else '-',
         ])
     response = HttpResponse(output.getvalue(), content_type='text/csv; charset=utf-8')
@@ -1822,8 +2354,8 @@ def ab_dashboard(request):
     total_tags = 0
     profile_stats = []
     for profile in profiles:
-        peers_count = RustDeskPeer.objects.filter(Q(uid=profile.owner_id) & Q(profile_guid=profile.guid)).count()
-        tags_count = RustDeskTag.objects.filter(Q(uid=profile.owner_id) & Q(profile_guid=profile.guid)).count()
+        peers_count = profile.peers.count()
+        tags_count = profile.tags.count()
         total_peers += peers_count
         total_tags += tags_count
         profile_stats.append({
@@ -1989,7 +2521,7 @@ def ab_rules_export(request):
         )
 
     output = StringIO()
-    writer = csv.writer(output)
+    writer = safe_csv_writer(output)
     writer.writerow([_('地址簿'), _('地址簿 GUID'), _('所属用户'), _('类型'), _('目标'), _('权限')])
     for entry in rules:
         writer.writerow([
@@ -2044,7 +2576,7 @@ def ab_shares_export(request):
         return response
 
     output = StringIO()
-    writer = csv.writer(output)
+    writer = safe_csv_writer(output)
     writer.writerow(headers)
     for share in rows:
         profile = share.profile
@@ -2106,7 +2638,11 @@ def ab_audit(request):
             'target_type': _rule_target_label(audit.target_type),
             'target_name': audit.target_name or '-',
             'rule_label': _rule_label(audit.rule),
-            'details': audit.details or '',
+            'details': (
+                json.dumps(audit.details, ensure_ascii=False)
+                if audit.details
+                else ''
+            ),
         })
 
     return render(
@@ -2122,65 +2658,11 @@ def ab_audit(request):
     )
 
 
-def get_conn_log():
-    logs = ConnLog.objects.all()
-    logs = {x.id: model_to_dict(x) for x in logs}
-
-    for k, v in logs.items():
-        try:
-            peer = RustDeskPeer.objects.get(rid=v['rid'])
-            logs[k]['alias'] = peer.alias
-        except: # noqa
-            logs[k]['alias'] = _('UNKNOWN')
-        try:
-            peer = RustDeskPeer.objects.get(rid=v['from_id'])
-            logs[k]['from_alias'] = peer.alias
-        except: # noqa
-            logs[k]['from_alias'] = _('UNKNOWN')
-        # from_zone = tz.tzutc()
-        # to_zone = tz.tzlocal()
-        # utc = logs[k]['logged_at']
-        # utc = utc.replace(tzinfo=from_zone)
-        # logs[k]['logged_at'] = utc.astimezone(to_zone)
-        try:
-            duration = round((logs[k]['conn_end'] - logs[k]['conn_start']).total_seconds())
-            m, s = divmod(duration, 60)
-            h, m = divmod(m, 60)
-            # d, h = divmod(h, 24)
-            logs[k]['duration'] = f'{h:02d}:{m:02d}:{s:02d}'
-        except:   # noqa
-            logs[k]['duration'] = -1
-
-    sorted_logs = sorted(logs.items(), key=lambda x: x[1]['conn_start'], reverse=True)
-    new_ordered_dict = {}
-    for key, alog in sorted_logs:
-        new_ordered_dict[key] = alog
-
-    return [v for k, v in new_ordered_dict.items()]
-
-
-def get_file_log():
-    logs = FileLog.objects.all()
-    logs = {x.id: model_to_dict(x) for x in logs}
-
-    for k, v in logs.items():
-        try:
-            peer_remote = RustDeskPeer.objects.get(rid=v['remote_id'])
-            logs[k]['remote_alias'] = peer_remote.alias
-        except:   # noqa
-            logs[k]['remote_alias'] = _('UNKNOWN')
-        try:
-            peer_user = RustDeskPeer.objects.get(rid=v['user_id'])
-            logs[k]['user_alias'] = peer_user.alias
-        except:   # noqa
-            logs[k]['user_alias'] = _('UNKNOWN')
-
-    sorted_logs = sorted(logs.items(), key=lambda x: x[1]['logged_at'], reverse=True)
-    new_ordered_dict = {}
-    for key, alog in sorted_logs:
-        new_ordered_dict[key] = alog
-
-    return [v for k, v in new_ordered_dict.items()]
+def _peer_alias_map(peer_ids):
+    aliases = {}
+    for peer in RustDeskPeer.objects.filter(rid__in=peer_ids).order_by('pk'):
+        aliases.setdefault(peer.rid, peer.alias or _('UNKNOWN'))
+    return aliases
 
 
 @login_required(login_url='/api/user_action?action=login')
@@ -2188,9 +2670,35 @@ def conn_log(request):
     if not request.user.is_admin:
         _log_event(request, 'front_conn_log_denied', level="warning", username=request.user.username)
         return HttpResponseRedirect('/api/home')
-    paginator = Paginator(get_conn_log(), 20)
+    paginator = Paginator(
+        ConnLog.objects.select_related('reporter').order_by('-conn_start', '-id'),
+        20,
+    )
     page_number = request.GET.get('page')
     page_obj = paginator.get_page(page_number)
+    logs = list(page_obj.object_list)
+    aliases = _peer_alias_map(
+        {
+            peer_id
+            for log in logs
+            for peer_id in (log.rid, log.from_id)
+            if peer_id
+        }
+    )
+    entries = []
+    for log in logs:
+        item = model_to_dict(log)
+        item['alias'] = aliases.get(log.rid, _('UNKNOWN'))
+        item['from_alias'] = aliases.get(log.from_id, _('UNKNOWN'))
+        if log.conn_start and log.conn_end:
+            duration = max(0, round((log.conn_end - log.conn_start).total_seconds()))
+            minutes, seconds = divmod(duration, 60)
+            hours, minutes = divmod(minutes, 60)
+            item['duration'] = f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+        else:
+            item['duration'] = '-'
+        entries.append(item)
+    page_obj.object_list = entries
     _log_event(request, 'front_conn_log_view', username=request.user.username, page=page_number)
     return render(
         request,
@@ -2204,9 +2712,29 @@ def file_log(request):
     if not request.user.is_admin:
         _log_event(request, 'front_file_log_denied', level="warning", username=request.user.username)
         return HttpResponseRedirect('/api/home')
-    paginator = Paginator(get_file_log(), 20)
+    paginator = Paginator(
+        FileLog.objects.select_related('reporter').order_by('-logged_at', '-id'),
+        20,
+    )
     page_number = request.GET.get('page')
     page_obj = paginator.get_page(page_number)
+    logs = list(page_obj.object_list)
+    aliases = _peer_alias_map(
+        {
+            peer_id
+            for log in logs
+            for peer_id in (log.remote_id, log.user_id)
+            if peer_id
+        }
+    )
+    entries = []
+    for log in logs:
+        item = model_to_dict(log)
+        item['remote_alias'] = aliases.get(log.remote_id, _('UNKNOWN'))
+        item['user_alias'] = aliases.get(log.user_id, _('UNKNOWN'))
+        item['filesize_display'] = format_bytes(log.filesize)
+        entries.append(item)
+    page_obj.object_list = entries
     _log_event(request, 'front_file_log_view', username=request.user.username, page=page_number)
     return render(
         request,

@@ -1,86 +1,96 @@
-from django.db import models
 from django.contrib.auth.models import (
-    BaseUserManager,AbstractBaseUser,PermissionsMixin
+    AbstractBaseUser,
+    BaseUserManager,
+    PermissionsMixin,
 )
-from .models_work import *
+from django.contrib.auth.validators import UnicodeUsernameValidator
+from django.db import models
+from django.db.models.functions import Lower
 from django.utils.translation import gettext_lazy as _
 
-class MyUserManager(BaseUserManager):
-    def create_user(self, username, password=None, **extra_fields):
-        if not username:
-            raise ValueError('Users must have an username')
 
+class MyUserManager(BaseUserManager):
+    use_in_migrations = True
+
+    def create_user(self, username, password=None, **extra_fields):
+        username = str(username or "").strip()
+        if not username:
+            raise ValueError("Users must have a username")
+        email = extra_fields.get("email")
+        if email is not None:
+            extra_fields["email"] = self.normalize_email(email)
         user = self.model(username=username, **extra_fields)
- 
         user.set_password(password)
+        user.full_clean()
         user.save(using=self._db)
         return user
- 
+
     def create_superuser(self, username, password, **extra_fields):
-        user = self.create_user(username, password=password, **extra_fields)
-        user.is_admin = True
-        user.is_superuser = True
-        user.save(using=self._db)
-        return user
+        extra_fields.setdefault("is_active", True)
+        extra_fields.setdefault("is_admin", True)
+        extra_fields.setdefault("is_superuser", True)
+        if extra_fields.get("is_admin") is not True:
+            raise ValueError("A superuser must have is_admin=True")
+        if extra_fields.get("is_superuser") is not True:
+            raise ValueError("A superuser must have is_superuser=True")
+        return self.create_user(username, password=password, **extra_fields)
 
 
 class UserProfile(AbstractBaseUser, PermissionsMixin):
-    username = models.CharField(_('用户名'), 
-                                unique=True,
-                                max_length=50)
-    email = models.CharField(_('邮箱'), max_length=120, blank=True, default='')
-    note = models.TextField(_('备注'), blank=True, default='')
-    group_name = models.CharField(_('用户组'), max_length=120, blank=True, default='')
-    strategy_name = models.CharField(_('策略名称'), max_length=60, blank=True, default='')
-    
-    rid = models.CharField(verbose_name='Camellia ID', max_length=16)
-    uuid = models.CharField(verbose_name='uuid', max_length=60)
-    autoLogin = models.BooleanField(verbose_name='autoLogin', default=True)
-    rtype = models.CharField(verbose_name='rtype', max_length=20)
-    deviceInfo = models.TextField(verbose_name=_('登录信息:'), blank=True)
-    
-    is_active = models.BooleanField(verbose_name=_('是否激活'), default=True)
-    is_admin = models.BooleanField(verbose_name=_('是否管理员'), default=False)
-    tfa_enforced = models.BooleanField(verbose_name=_('强制双因素认证'), default=False)
-    login_verification_disabled = models.BooleanField(verbose_name=_('禁用登录验证'), default=False)
+    username = models.CharField(
+        _("用户名"),
+        unique=True,
+        max_length=50,
+        validators=[UnicodeUsernameValidator()],
+    )
+    email = models.EmailField(_("邮箱"), max_length=254, blank=True, default="")
+    note = models.TextField(_("备注"), blank=True, default="")
+    strategy = models.ForeignKey(
+        "api.StrategyProfile",
+        verbose_name=_("策略"),
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="users",
+    )
+    is_active = models.BooleanField(_("是否激活"), default=True)
+    is_admin = models.BooleanField(_("是否管理员"), default=False)
 
     objects = MyUserManager()
- 
-    USERNAME_FIELD = 'username'  # 用作用户名的字段
+
+    USERNAME_FIELD = "username"
     REQUIRED_FIELDS = []
-    
-    
+
     def get_full_name(self):
-        # The user is identified by their email address
         return self.username
- 
+
     def get_short_name(self):
-        # The user is identified by their email address
         return self.username
- 
-    def __str__(self):              # __unicode__ on Python 2
+
+    def __str__(self):
         return self.username
- 
-    def has_perm(self, perm, obj=None):    #有没有指定的权限
+
+    def has_perm(self, perm, obj=None):
         return self.is_active and (self.is_admin or self.is_superuser)
- 
+
     def has_module_perms(self, app_label):
         return self.is_active and (self.is_admin or self.is_superuser)
-        
-
 
     @property
     def is_staff(self):
-        "Is the user a member of staff?"
-        # Simplest possible answer: All admins are staff 
         return self.is_admin
 
     class Meta:
-    
         verbose_name = _("用户")
         verbose_name_plural = _("用户列表")
         permissions = (
             ("view_task", "Can see available tasks"),
             ("change_task_status", "Can change the status of tasks"),
             ("close_task", "Can remove a task by setting its status as closed"),
+        )
+        constraints = (
+            models.UniqueConstraint(
+                Lower("username"),
+                name="unique_username_case_insensitive",
+            ),
         )
