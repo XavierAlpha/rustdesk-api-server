@@ -24,7 +24,7 @@ concurrency:
 jobs:
   quality:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       DEBUG: "true"
@@ -35,16 +35,20 @@ jobs:
       DEVICE_VERIFICATION_TOKEN: ci-device-verification-token-with-sufficient-length
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
+          version: "0.11.30"
           enable-cache: true
           cache-dependency-glob: uv.lock
 
       - name: Install dependencies
         run: uv sync --locked --all-groups
+
+      - name: Audit dependencies
+        run: uv audit --locked --preview-features audit-command
 
       - name: Static analysis
         run: |
@@ -63,7 +67,9 @@ jobs:
           DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
           DEVICE_VERIFICATION_TOKEN: ci-device-verification-token-with-sufficient-length
           SECURE_TLS: "true"
-        run: uv run python manage.py check --deploy
+          SECURE_HSTS_INCLUDE_SUBDOMAINS: "true"
+          SECURE_HSTS_PRELOAD: "true"
+        run: uv run python manage.py check --deploy --fail-level WARNING
 
       - name: Fresh database migration
         env:
@@ -76,17 +82,17 @@ jobs:
   container:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
     needs: quality
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Build runtime image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: ./Dockerfile
@@ -136,7 +142,7 @@ jobs:
 
       - name: Verify container readiness
         run: |
-          for attempt in $(seq 1 30); do
+          for _attempt in $(seq 1 30); do
             if docker exec camellia-api-ci python -c \
               'import json, urllib.request; request = urllib.request.Request("http://127.0.0.1:21114/health/ready", headers={"X-Forwarded-Proto": "https"}); response = urllib.request.urlopen(request, timeout=2); assert response.status == 200 and json.load(response)["status"] == "ready"'; then
               exit 0
