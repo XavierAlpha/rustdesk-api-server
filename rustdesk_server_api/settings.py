@@ -57,7 +57,17 @@ _secure_tls = env_bool("SECURE_TLS", False)
 SESSION_COOKIE_SECURE = _secure_tls
 CSRF_COOKIE_SECURE = _secure_tls
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https") if _secure_tls else None
-SECURE_HSTS_SECONDS = env_int("SECURE_HSTS_SECONDS", 0, 0, 63072000)
+SECURE_SSL_REDIRECT = _secure_tls
+SECURE_HSTS_SECONDS = env_int(
+    "SECURE_HSTS_SECONDS",
+    31536000 if _secure_tls else 0,
+    0,
+    63072000,
+)
+SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", _secure_tls)
+SECURE_HSTS_PRELOAD = env_bool("SECURE_HSTS_PRELOAD", _secure_tls)
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "same-origin"
 SESSION_COOKIE_HTTPONLY = True
 AUTH_USER_MODEL = "api.UserProfile"
 
@@ -83,7 +93,25 @@ if _oidc_name and _oidc_issuer and _oidc_client_id and _oidc_client_secret and _
         "scope": os.environ.get("OIDC_SCOPE", "openid email profile"),
     }
 
-ALLOW_REGISTRATION = env_bool("ALLOW_REGISTRATION", True)
+ALLOW_REGISTRATION = env_bool("ALLOW_REGISTRATION", False)
+
+# Recording uploads contain highly sensitive session data. Keep each request
+# bounded before Django materializes request.body, and cap the resulting file so
+# a valid but compromised device session cannot exhaust the server volume.
+RECORD_UPLOAD_MAX_CHUNK_BYTES = env_int(
+    "RECORD_UPLOAD_MAX_CHUNK_BYTES",
+    4 * 1024 * 1024,
+    64 * 1024,
+    64 * 1024 * 1024,
+)
+RECORD_UPLOAD_MAX_FILE_BYTES = env_int(
+    "RECORD_UPLOAD_MAX_FILE_BYTES",
+    10 * 1024 * 1024 * 1024,
+    RECORD_UPLOAD_MAX_CHUNK_BYTES,
+    1024 * 1024 * 1024 * 1024,
+)
+RECORD_UPLOAD_ROOT = Path(os.environ.get("RECORD_UPLOAD_ROOT", BASE_DIR / "records"))
+DATA_UPLOAD_MAX_MEMORY_SIZE = RECORD_UPLOAD_MAX_CHUNK_BYTES
 
 
 # ==========数据库配置 开始=====================

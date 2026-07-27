@@ -5,7 +5,7 @@ Camellia API Server 是 Camellia 客户端、RustDesk Server 与 Web 控制端�
 ## 功能
 
 - `/api/*`：客户端认证、设备、地址簿、设备组、策略与审计接口。
-- `/lic/web/api/plugin-sign`：插件签名接口，使用 Ed25519 签名密钥。
+- `/lic/web/api/plugin-sign`：仅管理员 Bearer 会话可用的 Ed25519 插件签名接口。
 - `/webui2/`：Web 客户端入口，加载 `static/web_client`。
 - `/admin/`：Django 管理后台。
 
@@ -27,6 +27,7 @@ pip install -r requirements-dev.txt
 export DEBUG=true
 export SECRET_KEY=dev-only-secret
 python manage.py migrate
+python manage.py createsuperuser
 python manage.py runserver 0.0.0.0:21114
 ```
 
@@ -48,14 +49,24 @@ python -m pytest
 | `SECRET_KEY` | 无 | `DEBUG=false` 时必须提供高强度随机值。 |
 | `ALLOWED_HOSTS` | `127.0.0.1,localhost` | Django 允许访问的主机名。 |
 | `CSRF_TRUSTED_ORIGINS` | `http://127.0.0.1:21114` | 反向代理或公开域名 Origin。 |
+| `SECURE_TLS` | `false` | 生产 HTTPS 模式：启用安全 Cookie、代理协议识别、HTTPS 跳转和 HSTS。 |
+| `SECURE_HSTS_SECONDS` | TLS 模式下 `31536000` | HSTS 时长；仅在确认域名始终使用 HTTPS 后启用。 |
+| `SECURE_HSTS_INCLUDE_SUBDOMAINS` | TLS 模式下 `true` | 将 HSTS 应用于该主机的子域；混合 HTTP 域名需显式设为 `false`。 |
+| `SECURE_HSTS_PRELOAD` | TLS 模式下 `true` | 输出 HSTS preload 指令；提交 preload 列表前需确认域名策略。 |
+| `TRUST_PROXY_HEADERS` | `false` | 仅当前置代理覆盖客户端转发头时启用。 |
 | `LANGUAGE_CODE` | `zh-hans` | `zh-hans` 或 `en`。 |
 | `TIME_ZONE` | `Asia/Shanghai` | Django 时区。 |
 | `LOG_LEVEL` | `INFO` | `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`。 |
 | `PORT` | `21114` | Gunicorn 监听端口。 |
 | `HOST` | `0.0.0.0` | Gunicorn 监听地址。 |
 | `GUNICORN_WORKERS` | `2` | Gunicorn worker 数量。 |
-| `ALLOW_REGISTRATION` | `true` | 是否允许前台注册。 |
+| `ALLOW_REGISTRATION` | `false` | 是否允许前台注册；注册用户始终为普通用户。 |
 | `PLUGIN_SIGNING_KEY` | 无 | 32 字节 Ed25519 私钥，支持 base64 或 hex。未配置时插件签名返回 503。 |
+| `RECORD_UPLOAD_MAX_CHUNK_BYTES` | `4194304` | 单次录像上传请求的最大字节数。 |
+| `RECORD_UPLOAD_MAX_FILE_BYTES` | `10737418240` | 单个录像文件的最大字节数。 |
+| `RECORD_UPLOAD_ROOT` | `records` | 按用户和设备隔离保存的录像根目录。 |
+
+生产环境必须通过 `python manage.py createsuperuser` 或受控的自动化流程显式创建首位管理员。公开注册绝不会自动授予管理员权限。
 
 ### 数据库
 

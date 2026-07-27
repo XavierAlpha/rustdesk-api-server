@@ -7,6 +7,7 @@ import datetime
 import logging
 import math
 import os
+import re
 import secrets
 import uuid
 from django.contrib import auth
@@ -47,7 +48,13 @@ MAX_DEPLOY_KEY_LEN = 512
 MAX_PLUGIN_SIGN_MSG_BYTES = 64 * 1024
 OIDC_PENDING_MINUTES = 5
 LOGIN_LOCK_MAX_FAILURES = 10
+LOGIN_LOCK_MAX_IP_FAILURES = 100
 LOGIN_LOCK_WINDOW_MINUTES = 15
+MAX_DEVICE_INFO_BYTES = 16 * 1024
+MAX_AUDIT_INFO_BYTES = 16 * 1024
+MAX_AUDIT_NOTE_BYTES = 16 * 1024
+MAX_AUDIT_FILES = 10
+RECORD_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,255}$")
 
 
 def _load_json(request):
@@ -97,7 +104,7 @@ def _token_expired(token):
     return False
 
 
-def _issue_access_token(user):
+def _issue_access_token(user, rid, device_uuid):
     '''Create or rotate the token for this (user, device); returns (token, raw_token).
 
     The raw token is returned to the client exactly once; only its hash is stored.
@@ -109,8 +116,8 @@ def _issue_access_token(user):
     # one valid hash, rather than one live token nothing will ever revoke.
     token, _created = RustDeskToken.objects.update_or_create(
         uid=str(user.id),
-        rid=user.rid,
-        uuid=user.uuid,
+        rid=rid,
+        uuid=device_uuid,
         defaults={
             'username': user.username[:20],
             'access_token': _hash_token(raw_token),
@@ -118,6 +125,34 @@ def _issue_access_token(user):
         },
     )
     return token, raw_token
+
+
+def _valid_device_identity(rid, device_uuid):
+    if not isinstance(rid, str) or not isinstance(device_uuid, str):
+        return False
+    if not (1 <= len(rid) <= 16 and 1 <= len(device_uuid) <= 60):
+        return False
+    return all(ch.isprintable() and not ch.isspace() for ch in rid + device_uuid)
+
+
+def _get_device_token_user(request, rid, device_uuid):
+    token, user = _get_token_user(request)
+    if not token or not user:
+        return token, None
+    if token.rid != rid or token.uuid != device_uuid:
+        return token, None
+    return token, user
+
+
+def _get_active_token_device(token, user):
+    if not token or not user:
+        return None
+    device = RustDesDevice.objects.filter(Q(rid=token.rid) & Q(uuid=token.uuid)).first()
+    if not device or not device.is_active:
+        return None
+    if device.owner_id and device.owner_id != user.id and not user.is_admin:
+        return None
+    return device
 
 
 def _auth_body(user, raw_token):
@@ -194,17 +229,27 @@ def _log_event(request, event, level="info", **extra):
 
 
 def _record_dir():
-    base_dir = getattr(settings, "BASE_DIR", None)
-    if base_dir is None:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(os.fspath(base_dir), "records")
+    return os.fspath(settings.RECORD_UPLOAD_ROOT)
 
 
 def _safe_record_name(name):
-    name = os.path.basename(name or "").strip()
-    if not name:
+    if not isinstance(name, str) or name != os.path.basename(name):
         return ""
-    return name[:255]
+    return name if RECORD_NAME_RE.fullmatch(name) else ""
+
+
+def _record_device_dir(token):
+    namespace = hashlib.sha256(
+        f"{token.uid}\0{token.rid}\0{token.uuid}".encode()
+    ).hexdigest()
+    return os.path.join(_record_dir(), namespace)
+
+
+def _request_content_length(request):
+    try:
+        return int(request.META.get("CONTENT_LENGTH", "0") or 0)
+    except (TypeError, ValueError):
+        return -1
 
 
 def _plugin_signing_key():
@@ -359,6 +404,30 @@ def _device_update_fields(postdata):
     return updates
 
 
+def _validated_device_update_fields(postdata):
+    updates = _device_update_fields(postdata)
+    limits = {
+        'cpu': 100,
+        'hostname': 100,
+        'memory': 100,
+        'os': 100,
+        'username': 100,
+        'version': 100,
+        'device_group_name': 60,
+        'note': 4096,
+        'strategy_name': 60,
+        'address_book_name': 60,
+        'address_book_tag': 60,
+        'address_book_alias': 60,
+        'address_book_password': 128,
+        'address_book_note': 4096,
+    }
+    for field, value in updates.items():
+        if not isinstance(value, str) or len(value.encode()) > limits[field]:
+            return None
+    return updates
+
+
 def _valid_deploy_text(value, min_len=1, max_len=100):
     if not isinstance(value, str):
         return False
@@ -444,13 +513,16 @@ def _upsert_ab_peer(owner, guid, rid, data, is_personal):
     return peer
 
 
-def _login_locked(ip):
+def _login_locked(ip, username):
     window_start = timezone.now() - datetime.timedelta(minutes=LOGIN_LOCK_WINDOW_MINUTES)
-    return LoginAttempt.objects.filter(Q(ip=ip) & Q(created_at__gte=window_start)).count() >= LOGIN_LOCK_MAX_FAILURES
+    attempts = LoginAttempt.objects.filter(Q(ip=ip) & Q(created_at__gte=window_start))
+    if attempts.count() >= LOGIN_LOCK_MAX_IP_FAILURES:
+        return True
+    return attempts.filter(Q(username=username.casefold())).count() >= LOGIN_LOCK_MAX_FAILURES
 
 
 def _record_login_failure(ip, username):
-    LoginAttempt.objects.create(ip=ip or '', username=username[:150])
+    LoginAttempt.objects.create(ip=ip or '', username=username.casefold()[:150])
     # Opportunistic cleanup keeps the table tiny without a scheduled job.
     window_start = timezone.now() - datetime.timedelta(minutes=LOGIN_LOCK_WINDOW_MINUTES)
     LoginAttempt.objects.filter(created_at__lt=window_start).delete()
@@ -464,41 +536,43 @@ def login(request):
 
     data = _load_json(request)
 
-    username = str(data.get('username', '')).strip()
+    username_value = data.get('username', '')
+    username = username_value.strip() if isinstance(username_value, str) else ''
     password = data.get('password', '')
     rid = data.get('id', '')
     uuid = data.get('uuid', '')
-    autoLogin = data.get('autoLogin', True)
-    rtype = data.get('type', '')
     deviceInfo = data.get('deviceInfo', '')
+    if (
+        not username
+        or len(username) > UserProfile._meta.get_field('username').max_length
+        or not isinstance(password, str)
+        or not password
+        or len(password) > 1024
+        or not _valid_device_identity(rid, uuid)
+    ):
+        _log_event(request, 'api_login_invalid_payload', level="warning", username=username)
+        return JsonResponse({'error': 'Invalid login payload'}, status=400)
+    if isinstance(deviceInfo, (dict, list)):
+        serialized_device_info = json.dumps(deviceInfo, ensure_ascii=False)
+    elif isinstance(deviceInfo, str):
+        serialized_device_info = deviceInfo
+    else:
+        return JsonResponse({'error': 'Invalid deviceInfo'}, status=400)
+    if len(serialized_device_info.encode()) > MAX_DEVICE_INFO_BYTES:
+        return JsonResponse({'error': 'deviceInfo is too large'}, status=413)
     client_ip = get_client_ip(request)
-    if _login_locked(client_ip):
+    if _login_locked(client_ip, username):
         _log_event(request, 'api_login_locked', level="warning", username=username)
         return JsonResponse({'error': _('尝试次数过多，请稍后再试。')}, status=429)
     user = auth.authenticate(username=username, password=password)
     if not user:
-        candidate = UserProfile.objects.filter(Q(username__iexact=username)).first()
-        if candidate and candidate.check_password(password):
-            candidate.backend = 'django.contrib.auth.backends.ModelBackend'
-            user = candidate
-        else:
-            _record_login_failure(client_ip, username)
-            result['error'] = _('帐号或密码错误！请重试，多次重试后将被锁定IP！')
-            reason = 'password_mismatch' if candidate else 'user_not_found'
-            _log_event(request, 'api_login_failed', level="warning", username=username, reason=reason)
-            return JsonResponse(result, status=401)
+        _record_login_failure(client_ip, username)
+        result['error'] = _('帐号或密码错误！请重试，多次重试后将被锁定IP！')
+        _log_event(request, 'api_login_failed', level="warning", username=username)
+        return JsonResponse(result, status=401)
     if not user.is_active:
         _log_event(request, 'api_login_denied', level="warning", username=username, reason='inactive')
         return JsonResponse({'error': _('账号已被禁用')}, status=403)
-    user.rid = rid
-    user.uuid = uuid
-    user.autoLogin = autoLogin
-    user.rtype = rtype
-    if isinstance(deviceInfo, (dict, list)):
-        user.deviceInfo = json.dumps(deviceInfo, ensure_ascii=False)
-    else:
-        user.deviceInfo = str(deviceInfo)
-    user.save()
 
     device = RustDesDevice.objects.filter(Q(rid=rid) & Q(uuid=uuid)).first()
     if device and not device.is_active:
@@ -508,13 +582,13 @@ def login(request):
         _log_event(request, 'api_login_denied', level="warning", username=username, reason='device_owner_mismatch', rid=rid)
         return JsonResponse({'error': 'Permission denied'}, status=403)
     if device:
-        if device.owner_id is None or device.owner_id == user.id or user.is_admin:
+        if device.owner_id is None or device.owner_id == user.id:
             device.owner = user
             device.owner_name = user.username
-        device.save()
+            device.save(update_fields=['owner', 'owner_name', 'update_time'])
 
-    token, raw_token = _issue_access_token(user)
-    LoginAttempt.objects.filter(Q(ip=client_ip)).delete()
+    token, raw_token = _issue_access_token(user, rid, uuid)
+    LoginAttempt.objects.filter(Q(ip=client_ip) & Q(username=username.casefold())).delete()
 
     if rid:
         personal_guid = _personal_guid(user)
@@ -538,32 +612,18 @@ def login(request):
 
 
 def logout(request):
-    if request.method == 'GET':
-        result = {'error': _('请求方式错误！')}
+    if request.method != 'POST':
         _log_event(request, 'api_logout_invalid_method', level="warning")
-        return JsonResponse(result)
+        return JsonResponse({'error': _('请求方式错误！')}, status=405)
 
-    data = _load_json(request)
-    rid = data.get('id', '')
-    uuid = data.get('uuid', '')
     token, user = _get_token_user(request)
-    if not user and rid and uuid:
-        user = UserProfile.objects.filter(Q(rid=rid) & Q(uuid=uuid)).first()
-    if not user:
-        result = {'error': _('异常请求！')}
+    if not token or not user:
         _log_event(request, 'api_logout_failed', level="warning")
-        return JsonResponse(result)
-    if token is not None:
-        # Revoke exactly the token that authenticated this request. UserProfile.rid
-        # holds whichever device logged in most recently, so looking the token up
-        # again by rid signs out a different device and leaves this one valid.
-        token.delete()
-    elif rid and uuid:
-        # Unauthenticated fallback: the caller identified itself by device.
-        RustDeskToken.objects.filter(Q(uid=str(user.id)) & Q(rid=rid) & Q(uuid=uuid)).delete()
+        return JsonResponse({'error': _('异常请求！')}, status=401)
+    token.delete()
 
     result = {'code': 1}
-    _log_event(request, 'api_logout_success', username=user.username, rid=user.rid)
+    _log_event(request, 'api_logout_success', username=user.username, rid=token.rid)
     return JsonResponse(result)
 
 
@@ -676,94 +736,82 @@ def ab(request):
 
 
 def sysinfo(request):
-    # 客户端注册服务后，才会发送设备信息
-    result = {}
-    if request.method == 'GET':
-        result['error'] = _('错误的提交方式！')
+    if request.method != 'POST':
         _log_event(request, 'api_sysinfo_invalid_method', level="warning")
-        return JsonResponse(result)
+        return JsonResponse({'error': _('错误的提交方式！')}, status=405)
     client_ip = get_client_ip(request)
     postdata = _load_json(request)
-    if not postdata.get('id') or not postdata.get('uuid'):
+    rid = postdata.get('id')
+    device_uuid = postdata.get('uuid')
+    if not _valid_device_identity(rid, device_uuid):
         _log_event(request, 'api_sysinfo_missing_id', level="warning")
-        return HttpResponse('ID_NOT_FOUND')
-    updates = _device_update_fields(postdata)
-    owner_name = postdata.get('preset-username') or postdata.get('user_name', '')
-    device = RustDesDevice.objects.filter(Q(rid=postdata['id']) & Q(uuid=postdata['uuid'])).first()
-    if not device:
-        device = RustDesDevice(
-            rid=postdata['id'],
-            cpu=updates.get('cpu', postdata.get('cpu', '-')),
-            hostname=updates.get('hostname', postdata.get('hostname', postdata.get('device_name', '-'))),
-            memory=updates.get('memory', postdata.get('memory', '-')),
-            os=updates.get('os', postdata.get('os', '-')),
-            username=updates.get('username', postdata.get('username', postdata.get('device_username', '-'))),
-            uuid=postdata['uuid'],
-            version=updates.get('version', postdata.get('version', '-')),
-            ip_address=client_ip
-        )
-        for key, val in updates.items():
-            setattr(device, key, val)
-        _assign_owner(device, owner_name, link_user=False, allow_override=False)
-        device.save()
-    else:
+        return HttpResponse('ID_NOT_FOUND', status=400)
+    token, user = _get_device_token_user(request, rid, device_uuid)
+    if not token or not user:
+        _log_event(request, 'api_sysinfo_unauthorized', level="warning", rid=rid)
+        return JsonResponse({'error': 'Invalid device token'}, status=401)
+    updates = _validated_device_update_fields(postdata)
+    if updates is None:
+        _log_event(request, 'api_sysinfo_invalid_payload', level="warning", username=user.username, rid=rid)
+        return JsonResponse({'error': 'Invalid device information'}, status=400)
+    with transaction.atomic():
+        device = RustDesDevice.objects.select_for_update().filter(Q(rid=rid) & Q(uuid=device_uuid)).first()
+        if device and device.owner_id and device.owner_id != user.id and not user.is_admin:
+            _log_event(request, 'api_sysinfo_denied', level="warning", username=user.username, rid=rid)
+            return JsonResponse({'error': 'Permission denied'}, status=403)
+        if not device:
+            device = RustDesDevice(
+                rid=rid,
+                cpu=updates.get('cpu', '-'),
+                hostname=updates.get('hostname', '-'),
+                memory=updates.get('memory', '-'),
+                os=updates.get('os', '-'),
+                username=updates.get('username', '-'),
+                uuid=device_uuid,
+                version=updates.get('version', '-'),
+                ip_address=client_ip,
+                owner=user,
+                owner_name=user.username,
+            )
         for key, val in updates.items():
             setattr(device, key, val)
         device.ip_address = client_ip
-        _assign_owner(device, owner_name, link_user=False, allow_override=False)
+        if device.owner_id is None:
+            device.owner = user
+            device.owner_name = user.username
         device.save()
-    _log_event(request, 'api_sysinfo_updated', level="debug", rid=postdata.get('id', ''), uuid=postdata.get('uuid', ''))
+    _log_event(request, 'api_sysinfo_updated', level="debug", username=user.username, rid=rid, uuid=device_uuid)
     return HttpResponse('SYSINFO_UPDATED')
 
 
 def heartbeat(request):
+    if request.method != 'POST':
+        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')}, status=405)
     postdata = _load_json(request)
-    if not postdata.get('id') or not postdata.get('uuid'):
+    rid = postdata.get('id')
+    device_uuid = postdata.get('uuid')
+    if not _valid_device_identity(rid, device_uuid):
         _log_event(request, 'api_heartbeat_missing_id', level="warning")
-        return JsonResponse({'error': 'ID_NOT_FOUND'})
-    token = RustDeskToken.objects.filter(Q(rid=postdata['id']) & Q(uuid=postdata['uuid'])).first()
-    device = RustDesDevice.objects.filter(Q(rid=postdata['id']) & Q(uuid=postdata['uuid'])).first()
-    if device:
-        if not device.is_active:
-            _log_event(request, 'api_heartbeat_device_disabled', level="warning", rid=postdata.get('id', ''), uuid=postdata.get('uuid', ''))
-            return JsonResponse({'error': 'Device disabled'}, status=403)
-        client_ip = get_client_ip(request)
-        device.ip_address = client_ip
-        device.save()
-    else:
-        # Create a placeholder device to avoid repeated ID_NOT_FOUND, but only
-        # for well-formed identifiers: this endpoint is unauthenticated and must
-        # not be a vector for filling the device table with junk rows.
-        rid_value = str(postdata['id'])
-        uuid_value = str(postdata['uuid'])
-        if len(rid_value) > 16 or len(uuid_value) > 60 or not rid_value.isprintable():
-            _log_event(request, 'api_heartbeat_malformed_id', level="warning")
-            return JsonResponse({'error': 'ID_NOT_FOUND'})
-        device = RustDesDevice(
-            rid=postdata['id'],
-            cpu='-',
-            hostname='-',
-            memory='-',
-            os='-',
-            username='-',
-            uuid=postdata['uuid'],
-            version='-',
-            ip_address=get_client_ip(request)
-        )
-        device.save()
-
-    owner_hint = ''
-    if device:
-        if device.owner_name:
-            owner_hint = device.owner_name
-        elif device.owner:
-            owner_hint = device.owner.username
-    if not owner_hint and token and token.username:
-        owner_hint = token.username
+        return JsonResponse({'error': 'ID_NOT_FOUND'}, status=400)
+    token, user = _get_device_token_user(request, rid, device_uuid)
+    if not token or not user:
+        _log_event(request, 'api_heartbeat_unauthorized', level="warning", rid=rid)
+        return JsonResponse({'error': 'Invalid device token'}, status=401)
+    device = RustDesDevice.objects.filter(Q(rid=rid) & Q(uuid=device_uuid)).first()
+    if not device:
+        return JsonResponse({'error': 'ID_NOT_FOUND'}, status=404)
+    if not device.is_active:
+        _log_event(request, 'api_heartbeat_device_disabled', level="warning", username=user.username, rid=rid, uuid=device_uuid)
+        return JsonResponse({'error': 'Device disabled'}, status=403)
+    if device.owner_id and device.owner_id != user.id and not user.is_admin:
+        return JsonResponse({'error': 'Permission denied'}, status=403)
+    device.ip_address = get_client_ip(request)
+    device.save(update_fields=['ip_address', 'update_time'])
 
     # token保活
     expires_at = timezone.now() + datetime.timedelta(seconds=EFFECTIVE_SECONDS)
-    RustDeskToken.objects.filter(Q(rid=postdata['id']) & Q(uuid=postdata['uuid'])).update(expires_at=expires_at)
+    token.expires_at = expires_at
+    token.save(update_fields=['expires_at'])
     response = {}
     try:
         client_modified = int(postdata.get('modified_at', 0))
@@ -780,15 +828,17 @@ def heartbeat(request):
                 except Exception:
                     options = {}
                 response['strategy'] = {'config_options': options, 'extra': {}}
-    if owner_hint:
-        _log_event(request, 'api_heartbeat', level="debug", username=owner_hint, rid=postdata.get('id', ''), uuid=postdata.get('uuid', ''))
-    else:
-        _log_event(request, 'api_heartbeat', level="debug", rid=postdata.get('id', ''), uuid=postdata.get('uuid', ''))
+    _log_event(request, 'api_heartbeat', level="debug", username=user.username, rid=rid, uuid=device_uuid)
     return JsonResponse(response)
 
 
 def sysinfo_ver(request):
-    _log_event(request, 'api_sysinfo_ver', level="debug")
+    if request.method != 'POST':
+        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')}, status=405)
+    _token, user = _get_token_user(request)
+    if not user:
+        return JsonResponse({'error': 'Invalid token'}, status=401)
+    _log_event(request, 'api_sysinfo_ver', level="debug", username=user.username)
     return HttpResponse('1')
 
 
@@ -900,7 +950,7 @@ def oidc_callback(request):
         user.save()
         if not user.is_active:
             raise PermissionError("Account is disabled")
-        token, raw_token = _issue_access_token(user)
+        token, raw_token = _issue_access_token(user, session.rid, session.device_uuid)
         session.body = _auth_body(user, raw_token)
         session.status = OidcPendingAuth.STATUS_DONE
         session.save(update_fields=['body', 'status'])
@@ -1053,6 +1103,13 @@ def plugin_sign(request):
     if request.method != 'POST':
         _log_event(request, 'api_plugin_sign_invalid_method', level="warning")
         return JsonResponse({'error': _('请求方式错误！请使用POST方式。')}, status=405)
+    _token, user = _get_token_user(request)
+    if not user:
+        _log_event(request, 'api_plugin_sign_unauthorized', level="warning")
+        return JsonResponse({'error': 'Invalid token'}, status=401)
+    if not user.is_admin:
+        _log_event(request, 'api_plugin_sign_denied', level="warning", username=user.username)
+        return JsonResponse({'error': 'Admin required'}, status=403)
     signing_key = _plugin_signing_key()
     if signing_key is None:
         _log_event(request, 'api_plugin_sign_not_configured', level="warning")
@@ -1066,11 +1123,12 @@ def plugin_sign(request):
         if not isinstance(item, int) or item < 0 or item > 255:
             _log_event(request, 'api_plugin_sign_invalid_byte', level="warning")
             return JsonResponse({'error': 'Invalid msg'}, status=400)
-    signed_msg = signing_key.sign(bytes(msg)).signed_message
+    signed_msg = bytes(signing_key.sign(bytes(msg)))
     _log_event(
         request,
         'api_plugin_sign_ok',
         level="debug",
+        username=user.username,
         plugin_id=str(postdata.get('plugin_id', '')),
         version=str(postdata.get('version', '')),
     )
@@ -1080,41 +1138,77 @@ def plugin_sign(request):
 def record(request):
     if request.method != 'POST':
         _log_event(request, 'api_record_invalid_method', level="warning")
-        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')})
+        return JsonResponse({'error': _('请求方式错误！请使用POST方式。')}, status=405)
+    token, user = _get_token_user(request)
+    if not token or not user or not _get_active_token_device(token, user):
+        _log_event(request, 'api_record_unauthorized', level="warning")
+        return JsonResponse({'error': 'Invalid device token'}, status=401)
     record_type = request.GET.get('type', '')
     filename = _safe_record_name(request.GET.get('file', ''))
     if not filename:
         _log_event(request, 'api_record_invalid_file', level="warning")
         return JsonResponse({'error': 'Invalid file'}, status=400)
-    base_dir = _record_dir()
+    content_length = _request_content_length(request)
+    max_chunk = settings.RECORD_UPLOAD_MAX_CHUNK_BYTES
+    if content_length < 0 or content_length > max_chunk:
+        return JsonResponse({'error': 'Upload chunk is too large'}, status=413)
+    base_dir = _record_device_dir(token)
     os.makedirs(base_dir, exist_ok=True)
     filepath = os.path.join(base_dir, filename)
     if record_type == 'new':
-        with open(filepath, 'wb'):
-            pass
-        _log_event(request, 'api_record_new', level="info", file=filename)
+        if content_length != 0:
+            return JsonResponse({'error': 'New recording body must be empty'}, status=400)
+        try:
+            with open(filepath, 'xb'):
+                pass
+        except FileExistsError:
+            return JsonResponse({'error': 'Recording already exists'}, status=409)
+        _log_event(request, 'api_record_new', level="info", username=user.username, rid=token.rid, file=filename)
         return HttpResponse('')
     if record_type in ('part', 'tail'):
         try:
             offset = int(request.GET.get('offset', '0'))
-        except Exception:
-            offset = 0
-        if offset < 0:
-            offset = 0
+            declared_length = int(request.GET.get('length', '-1'))
+        except (TypeError, ValueError):
+            return JsonResponse({'error': 'Invalid upload range'}, status=400)
+        if offset < 0 or declared_length != content_length:
+            return JsonResponse({'error': 'Invalid upload range'}, status=400)
         data = request.body or b''
-        mode = 'r+b' if os.path.exists(filepath) else 'wb+'
-        with open(filepath, mode) as f:
-            if offset > 0:
-                f.seek(offset)
+        if len(data) != content_length:
+            return JsonResponse({'error': 'Incomplete upload body'}, status=400)
+        try:
+            current_size = os.path.getsize(filepath)
+        except FileNotFoundError:
+            return JsonResponse({'error': 'Recording does not exist'}, status=404)
+        if record_type == 'part':
+            if offset != current_size:
+                return JsonResponse({'error': 'Upload offset conflict'}, status=409)
+            if current_size + len(data) > settings.RECORD_UPLOAD_MAX_FILE_BYTES:
+                return JsonResponse({'error': 'Recording is too large'}, status=413)
+        elif offset != 0:
+            return JsonResponse({'error': 'Invalid tail offset'}, status=400)
+        with open(filepath, 'r+b') as f:
+            f.seek(offset)
             f.write(data)
-        _log_event(request, 'api_record_write', level="debug", file=filename, offset=offset, size=len(data))
+        _log_event(
+            request,
+            'api_record_write',
+            level="debug",
+            username=user.username,
+            rid=token.rid,
+            file=filename,
+            offset=offset,
+            size=len(data),
+        )
         return HttpResponse('')
     if record_type == 'remove':
+        if content_length != 0:
+            return JsonResponse({'error': 'Remove recording body must be empty'}, status=400)
         try:
             os.remove(filepath)
         except FileNotFoundError:
             pass
-        _log_event(request, 'api_record_remove', level="info", file=filename)
+        _log_event(request, 'api_record_remove', level="info", username=user.username, rid=token.rid, file=filename)
         return HttpResponse('')
     return JsonResponse({'error': 'Invalid type'}, status=400)
 
@@ -1122,9 +1216,11 @@ def record(request):
 def audit_with_type(request, typ):
     _log_event(request, 'api_audit_dispatch', level="debug", typ=typ)
     if request.method == 'GET':
-        if typ.startswith('conn/active'):
+        if typ == 'conn/active':
             return _audit_conn_active(request)
-        return JsonResponse('', safe=False)
+        return JsonResponse({'error': 'Not found'}, status=404)
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
     if typ == 'conn':
         return _audit_conn(request)
     if typ == 'file':
@@ -1132,13 +1228,13 @@ def audit_with_type(request, typ):
     if typ == 'alarm':
         return _audit_alarm(request)
     _log_event(request, 'api_audit_unknown', level="warning", typ=typ)
-    return _audit_conn(request)
+    return JsonResponse({'error': 'Not found'}, status=404)
 
 
 def audit_note(request):
     if request.method != 'PUT':
         _log_event(request, 'api_audit_note_invalid_method', level="warning")
-        return JsonResponse({'error': _('请求方式错误！')})
+        return JsonResponse({'error': _('请求方式错误！')}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, 'api_audit_note_unauthorized', level="warning")
@@ -1146,10 +1242,17 @@ def audit_note(request):
     postdata = _load_json(request)
     guid = postdata.get('guid', '')
     note = postdata.get('note', '')
-    if not guid:
+    if not isinstance(guid, str) or not guid or not isinstance(note, str):
         _log_event(request, 'api_audit_note_invalid_guid', level="warning")
-        return JsonResponse({'error': 'Invalid guid'}, status=400)
-    AuditSession.objects.filter(Q(guid=guid)).update(note=note)
+        return JsonResponse({'error': 'Invalid audit note'}, status=400)
+    if len(note.encode()) > MAX_AUDIT_NOTE_BYTES:
+        return JsonResponse({'error': 'Audit note is too large'}, status=413)
+    sessions = AuditSession.objects.filter(Q(guid=guid))
+    if not user.is_admin:
+        sessions = sessions.filter(Q(actor=user))
+    if sessions.update(note=note) != 1:
+        _log_event(request, 'api_audit_note_denied', level="warning", username=user.username, guid=guid)
+        return JsonResponse({'error': 'Audit session not found'}, status=404)
     _log_event(request, 'api_audit_note_update', username=user.username, guid=guid)
     return JsonResponse({'code': 1, 'data': 'ok'})
 
@@ -1157,10 +1260,7 @@ def audit_note(request):
 def audit_root(request):
     if request.method == 'PUT':
         return audit_note(request)
-    if request.method == 'GET':
-        _log_event(request, 'api_audit_root_get', level="debug")
-        return JsonResponse('', safe=False)
-    return _audit_conn(request)
+    return JsonResponse({'error': 'Method not allowed'}, status=405)
 
 
 def ab_settings(request):
@@ -1833,9 +1933,29 @@ def ab_tag_delete(request, guid):
     return HttpResponse('')
 
 
+def _audit_device_context(request, postdata):
+    rid = postdata.get('id')
+    device_uuid = postdata.get('uuid')
+    if not _valid_device_identity(rid, device_uuid):
+        return None, None, JsonResponse({'error': 'Invalid device identity'}, status=400)
+    token, user = _get_device_token_user(request, rid, device_uuid)
+    if not token or not user:
+        return None, None, JsonResponse({'error': 'Invalid device token'}, status=401)
+    device = _get_active_token_device(token, user)
+    if not device:
+        return None, None, JsonResponse({'error': 'Device is not active'}, status=403)
+    return token, user, None
+
+
+def _bounded_audit_text(value, max_bytes):
+    if not isinstance(value, str) or len(value.encode()) > max_bytes:
+        return None
+    return value
+
+
 def _audit_conn_active(request):
     token, user = _get_token_user(request)
-    if not user:
+    if not token or not user:
         _log_event(request, 'api_audit_conn_active_unauthorized', level="warning")
         return JsonResponse('', safe=False, status=401)
     peer_id = request.GET.get('id', '')
@@ -1844,24 +1964,83 @@ def _audit_conn_active(request):
         conn_type = int(request.GET.get('conn_type', 0))
     except Exception:
         conn_type = 0
-    if not peer_id or not session_id:
+    if (
+        not isinstance(peer_id, str)
+        or not peer_id
+        or len(peer_id) > 20
+        or not isinstance(session_id, str)
+        or not session_id
+        or len(session_id) > 60
+    ):
         _log_event(request, 'api_audit_conn_active_failed', level="warning", reason='missing_id')
+        return JsonResponse('', safe=False, status=400)
+    conn_exists = ConnLog.objects.filter(
+        Q(rid=peer_id) & Q(session_id=session_id) & Q(from_id=token.rid)
+    ).exists()
+    if not conn_exists and not user.is_admin:
+        # The host posts the controller identity after the initial connection
+        # record. An empty 200 keeps the client's bounded retry loop alive
+        # without exposing another user's audit GUID.
         return JsonResponse('', safe=False)
-    session = AuditSession.objects.filter(Q(peer_id=peer_id) & Q(session_id=session_id)).first()
-    if not session:
-        session = AuditSession(
-            guid=uuid.uuid4().hex,
+    with transaction.atomic():
+        session, _created = AuditSession.objects.select_for_update().get_or_create(
             peer_id=peer_id,
             session_id=session_id,
-            conn_type=conn_type,
+            defaults={'guid': uuid.uuid4().hex, 'conn_type': conn_type, 'actor': user},
         )
-        session.save()
-    else:
+        if session.actor_id and session.actor_id != user.id and not user.is_admin:
+            return JsonResponse('', safe=False, status=403)
+        update_fields = []
+        if session.actor_id is None:
+            session.actor = user
+            update_fields.append('actor')
         if conn_type and session.conn_type != conn_type:
             session.conn_type = conn_type
-            session.save(update_fields=['conn_type'])
+            update_fields.append('conn_type')
+        if update_fields:
+            session.save(update_fields=update_fields)
     _log_event(request, 'api_audit_conn_active', level="debug", username=user.username, peer_id=peer_id, session_id=session_id, conn_type=conn_type)
     return JsonResponse(session.guid, safe=False)
+
+
+def _audit_controller_note(request, postdata):
+    token, user = _get_token_user(request)
+    if not token or not user:
+        return JsonResponse({'error': 'Invalid token'}, status=401)
+    peer_id = postdata.get('id')
+    raw_session_id = postdata.get('session_id')
+    note = postdata.get('note')
+    if isinstance(raw_session_id, bool) or not isinstance(raw_session_id, (str, int)):
+        return JsonResponse({'error': 'Invalid audit note'}, status=400)
+    session_id = str(raw_session_id)
+    if (
+        not isinstance(peer_id, str)
+        or not peer_id
+        or len(peer_id) > 20
+        or not session_id
+        or len(session_id) > 60
+        or not isinstance(note, str)
+        or len(note.encode()) > MAX_AUDIT_NOTE_BYTES
+    ):
+        return JsonResponse({'error': 'Invalid audit note'}, status=400)
+    participant = ConnLog.objects.filter(
+        Q(rid=peer_id) & Q(session_id=session_id) & Q(from_id=token.rid)
+    ).exists()
+    if not participant and not user.is_admin:
+        return JsonResponse({'error': 'Audit session not found'}, status=404)
+    with transaction.atomic():
+        session = AuditSession.objects.select_for_update().filter(
+            Q(peer_id=peer_id) & Q(session_id=session_id)
+        ).first()
+        if not session:
+            return JsonResponse({'error': 'Audit session not found'}, status=404)
+        if session.actor_id and session.actor_id != user.id and not user.is_admin:
+            return JsonResponse({'error': 'Audit session not found'}, status=404)
+        session.actor = session.actor or user
+        session.note = note
+        session.save(update_fields=['actor', 'note', 'updated_at'])
+    _log_event(request, 'api_audit_note_update', username=user.username, guid=session.guid)
+    return JsonResponse({'code': 1, 'data': 'ok'})
 
 
 def _audit_conn(request):
@@ -1869,25 +2048,44 @@ def _audit_conn(request):
     if not isinstance(postdata, dict):
         _log_event(request, 'api_audit_conn_invalid_payload', level="warning")
         return JsonResponse({'error': 'Invalid payload'}, status=400)
+    if 'note' in postdata and 'uuid' not in postdata:
+        return _audit_controller_note(request, postdata)
+    token, user, error = _audit_device_context(request, postdata)
+    if error:
+        return error
     action = postdata.get('action', '')
-    conn_id = postdata.get('conn_id', '')
-    peer_id = postdata.get('id', '')
-    session_id = postdata.get('session_id', '')
+    raw_conn_id = postdata.get('conn_id', '')
+    raw_session_id = postdata.get('session_id', '')
+    if isinstance(raw_conn_id, bool) or not isinstance(raw_conn_id, (str, int)):
+        return JsonResponse({'error': 'Invalid connection identity'}, status=400)
+    if isinstance(raw_session_id, bool) or not isinstance(raw_session_id, (str, int)):
+        return JsonResponse({'error': 'Invalid connection identity'}, status=400)
+    conn_id = _bounded_audit_text(str(raw_conn_id), 10)
+    peer_id = token.rid
+    session_id = _bounded_audit_text(str(raw_session_id), 60)
+    if conn_id is None or session_id is None or not conn_id:
+        return JsonResponse({'error': 'Invalid connection identity'}, status=400)
+    scoped_logs = ConnLog.objects.filter(Q(conn_id=conn_id) & Q(rid=token.rid) & Q(uuid=token.uuid))
     if action == 'new':
         conn_type = postdata.get('type', None)
         try:
             conn_type = int(conn_type) if conn_type is not None else None
-        except Exception:
-            conn_type = None
+        except (TypeError, ValueError):
+            return JsonResponse({'error': 'Invalid connection type'}, status=400)
+        source_ip = _bounded_audit_text(postdata.get('ip', ''), 30)
+        if source_ip is None:
+            return JsonResponse({'error': 'Invalid source IP'}, status=400)
+        if scoped_logs.exists():
+            return JsonResponse({'error': 'Connection already exists'}, status=409)
         ConnLog.objects.create(
             action=action,
             conn_id=conn_id,
-            from_ip=postdata.get('ip', ''),
+            from_ip=source_ip,
             from_id='',
             rid=peer_id,
             conn_start=timezone.now(),
             session_id=session_id,
-            uuid=postdata.get('uuid', ''),
+            uuid=token.uuid,
             conn_type=conn_type if conn_type is not None else None,
         )
         if peer_id and session_id:
@@ -1896,25 +2094,40 @@ def _audit_conn(request):
                 session_id=session_id,
                 defaults={'guid': uuid.uuid4().hex, 'conn_type': conn_type or 0},
             )
-        _log_event(request, 'api_audit_conn_new', level="info", conn_id=conn_id, peer_id=peer_id, session_id=session_id, conn_type=conn_type)
+        _log_event(request, 'api_audit_conn_new', level="info", username=user.username, conn_id=conn_id, peer_id=peer_id, session_id=session_id, conn_type=conn_type)
     elif action == 'close':
-        if conn_id:
-            ConnLog.objects.filter(Q(conn_id=conn_id)).update(conn_end=timezone.now())
-        _log_event(request, 'api_audit_conn_close', level="info", conn_id=conn_id, peer_id=peer_id, session_id=session_id)
+        if scoped_logs.update(conn_end=timezone.now()) != 1:
+            return JsonResponse({'error': 'Connection not found'}, status=404)
+        _log_event(request, 'api_audit_conn_close', level="info", username=user.username, conn_id=conn_id, peer_id=peer_id, session_id=session_id)
     else:
-        if conn_id and session_id:
-            ConnLog.objects.filter(Q(conn_id=conn_id)).update(session_id=session_id)
-        if conn_id and 'peer' in postdata:
+        if action not in ('', 'update'):
+            return JsonResponse({'error': 'Invalid action'}, status=400)
+        updates = {}
+        if session_id:
+            updates['session_id'] = session_id
+        if 'peer' in postdata:
             peer = postdata.get('peer', [])
             if isinstance(peer, (list, tuple)) and peer:
-                ConnLog.objects.filter(Q(conn_id=conn_id)).update(from_id=str(peer[0]))
-        if conn_id and 'type' in postdata:
+                from_id = _bounded_audit_text(str(peer[0]), 20)
+                if from_id is None:
+                    return JsonResponse({'error': 'Invalid peer identity'}, status=400)
+                updates['from_id'] = from_id
+            else:
+                return JsonResponse({'error': 'Invalid peer identity'}, status=400)
+        if 'type' in postdata:
             try:
                 update_type = int(postdata.get('type'))
-            except Exception:
-                update_type = postdata.get('type')
-            ConnLog.objects.filter(Q(conn_id=conn_id)).update(conn_type=update_type)
-        _log_event(request, 'api_audit_conn_update', level="debug", conn_id=conn_id, peer_id=peer_id, session_id=session_id)
+            except (TypeError, ValueError):
+                return JsonResponse({'error': 'Invalid connection type'}, status=400)
+            updates['conn_type'] = update_type
+        if 'note' in postdata:
+            note = _bounded_audit_text(postdata.get('note'), MAX_AUDIT_NOTE_BYTES)
+            if note is None:
+                return JsonResponse({'error': 'Invalid audit note'}, status=400)
+            AuditSession.objects.filter(Q(peer_id=peer_id) & Q(session_id=session_id)).update(note=note)
+        if updates and scoped_logs.update(**updates) != 1:
+            return JsonResponse({'error': 'Connection not found'}, status=404)
+        _log_event(request, 'api_audit_conn_update', level="debug", username=user.username, conn_id=conn_id, peer_id=peer_id, session_id=session_id)
     return JsonResponse({'code': 1, 'data': 'ok'})
 
 
@@ -1923,29 +2136,55 @@ def _audit_file(request):
     if not isinstance(postdata, dict):
         _log_event(request, 'api_audit_file_invalid_payload', level="warning")
         return JsonResponse({'error': 'Invalid payload'}, status=400)
+    token, user, error = _audit_device_context(request, postdata)
+    if error:
+        return error
     if 'is_file' not in postdata:
         return JsonResponse({'code': 1, 'data': 'ok'})
     info = postdata.get('info', '{}')
+    if isinstance(info, str) and len(info.encode()) > MAX_AUDIT_INFO_BYTES:
+        return JsonResponse({'error': 'Audit information is too large'}, status=413)
     try:
         info_obj = json.loads(info) if isinstance(info, str) else info
-    except Exception as e:
-        logger.warning('audit file info parse failed: %s', e)
-        info_obj = {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return JsonResponse({'error': 'Invalid audit information'}, status=400)
+    if not isinstance(info_obj, dict):
+        return JsonResponse({'error': 'Invalid audit information'}, status=400)
     files = info_obj.get('files', [])
     total_size = 0
-    if files and isinstance(files, list):
-        total_size = sum(int(f[1]) for f in files if isinstance(f, (list, tuple)) and len(f) > 1)
-    filesize = convert_filesize(int(total_size)) if total_size else ''
+    if files:
+        if not isinstance(files, list) or len(files) > MAX_AUDIT_FILES:
+            return JsonResponse({'error': 'Invalid audit files'}, status=400)
+        for item in files:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                return JsonResponse({'error': 'Invalid audit files'}, status=400)
+            try:
+                size = int(item[1])
+            except (TypeError, ValueError):
+                return JsonResponse({'error': 'Invalid audit files'}, status=400)
+            if size < 0 or size > settings.RECORD_UPLOAD_MAX_FILE_BYTES:
+                return JsonResponse({'error': 'Invalid audit files'}, status=400)
+            total_size += size
+    path = _bounded_audit_text(postdata.get('path', ''), 500)
+    user_ip = _bounded_audit_text(info_obj.get('ip', ''), 20)
+    remote_id = _bounded_audit_text(str(postdata.get('peer_id', '')), 20)
+    try:
+        direction = int(postdata.get('type', 0))
+    except (TypeError, ValueError):
+        return JsonResponse({'error': 'Invalid audit direction'}, status=400)
+    if path is None or user_ip is None or remote_id is None or not -16 <= direction <= 16:
+        return JsonResponse({'error': 'Invalid file audit'}, status=400)
+    filesize = convert_filesize(total_size) if total_size else ''
     FileLog.objects.create(
-        file=postdata.get('path', ''),
-        user_id=postdata.get('peer_id', ''),
-        user_ip=info_obj.get('ip', ''),
-        remote_id=postdata.get('id', ''),
+        file=path,
+        user_id=remote_id,
+        user_ip=user_ip,
+        remote_id=token.rid,
         filesize=filesize,
-        direction=postdata.get('type', 0),
+        direction=direction,
         logged_at=timezone.now(),
     )
-    _log_event(request, 'api_audit_file', level="info", peer_id=postdata.get('peer_id', ''), remote_id=postdata.get('id', ''), direction=postdata.get('type', 0), filesize=filesize)
+    _log_event(request, 'api_audit_file', level="info", username=user.username, peer_id=remote_id, remote_id=token.rid, direction=direction, filesize=filesize)
     return JsonResponse({'code': 1, 'data': 'ok'})
 
 
@@ -1954,11 +2193,21 @@ def _audit_alarm(request):
     if not isinstance(postdata, dict):
         _log_event(request, 'api_audit_alarm_invalid_payload', level="warning")
         return JsonResponse({'error': 'Invalid payload'}, status=400)
+    _token, user, error = _audit_device_context(request, postdata)
+    if error:
+        return error
+    try:
+        typ = int(postdata.get('typ', 0))
+    except (TypeError, ValueError):
+        return JsonResponse({'error': 'Invalid alarm type'}, status=400)
+    info = _bounded_audit_text(postdata.get('info', ''), MAX_AUDIT_INFO_BYTES)
+    if info is None or not -128 <= typ <= 128:
+        return JsonResponse({'error': 'Invalid alarm'}, status=400)
     AlarmLog.objects.create(
-        typ=postdata.get('typ', 0),
-        info=postdata.get('info', ''),
+        typ=typ,
+        info=info,
     )
-    _log_event(request, 'api_audit_alarm', level="warning", typ=postdata.get('typ', 0))
+    _log_event(request, 'api_audit_alarm', level="warning", username=user.username, typ=typ)
     return JsonResponse({'code': 1, 'data': 'ok'})
 
 

@@ -5,7 +5,7 @@ Camellia API Server is the management and coordination service used by the Camel
 ## Features
 
 - `/api/*`: client authentication, devices, address books, device groups, strategies, and audit APIs.
-- `/lic/web/api/plugin-sign`: plugin signing endpoint backed by an Ed25519 signing key.
+- `/lic/web/api/plugin-sign`: Ed25519 plugin signing for authenticated administrators.
 - `/webui2/`: Web client entry page that loads `static/web_client`.
 - `/admin/`: Django admin.
 
@@ -27,6 +27,7 @@ pip install -r requirements-dev.txt
 export DEBUG=true
 export SECRET_KEY=dev-only-secret
 python manage.py migrate
+python manage.py createsuperuser
 python manage.py runserver 0.0.0.0:21114
 ```
 
@@ -48,14 +49,24 @@ python -m pytest
 | `SECRET_KEY` | unset | Required when `DEBUG=false`; use a strong random value. |
 | `ALLOWED_HOSTS` | `127.0.0.1,localhost` | Allowed Django hosts. |
 | `CSRF_TRUSTED_ORIGINS` | `http://127.0.0.1:21114` | Public or reverse-proxy origins. |
+| `SECURE_TLS` | `false` | Production HTTPS mode: secure cookies, proxy scheme handling, HTTPS redirects, and HSTS. |
+| `SECURE_HSTS_SECONDS` | `31536000` in TLS mode | HSTS lifetime; enable only after the hostname is permanently HTTPS-only. |
+| `SECURE_HSTS_INCLUDE_SUBDOMAINS` | `true` in TLS mode | Applies HSTS to child hostnames; explicitly disable for mixed-HTTP domains. |
+| `SECURE_HSTS_PRELOAD` | `true` in TLS mode | Emits the HSTS preload directive; review the domain policy before preload-list submission. |
+| `TRUST_PROXY_HEADERS` | `false` | Enable only when the front proxy overwrites client forwarding headers. |
 | `LANGUAGE_CODE` | `zh-hans` | `zh-hans` or `en`. |
 | `TIME_ZONE` | `Asia/Shanghai` | Django time zone. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. |
 | `PORT` | `21114` | Gunicorn listen port. |
 | `HOST` | `0.0.0.0` | Gunicorn bind host. |
 | `GUNICORN_WORKERS` | `2` | Gunicorn worker count. |
-| `ALLOW_REGISTRATION` | `true` | Enables public registration. |
+| `ALLOW_REGISTRATION` | `false` | Enables public registration; registered accounts are always regular users. |
 | `PLUGIN_SIGNING_KEY` | unset | 32-byte Ed25519 signing key in base64 or hex. The signing endpoint returns 503 when unset. |
+| `RECORD_UPLOAD_MAX_CHUNK_BYTES` | `4194304` | Maximum bytes accepted by one recording upload request. |
+| `RECORD_UPLOAD_MAX_FILE_BYTES` | `10737418240` | Maximum bytes stored for one recording. |
+| `RECORD_UPLOAD_ROOT` | `records` | Root for per-user, per-device recording namespaces. |
+
+Create the first administrator explicitly with `python manage.py createsuperuser` or a controlled provisioning workflow. Public registration never grants administrator privileges.
 
 ### Database
 

@@ -1,7 +1,7 @@
 from django.shortcuts import render
 from django.http import HttpResponseRedirect
-from django.contrib.auth.hashers import make_password
 from django.http import JsonResponse
+from django.db import IntegrityError
 from django.db.models import Q
 from django.contrib.auth.decorators import login_required
 from django.contrib import auth, messages
@@ -252,24 +252,25 @@ def user_register(request):
         _log_event(request, 'front_register_failed', level="warning", username=username, reason='password_length')
         return JsonResponse(result)
 
-    user = UserProfile.objects.filter(Q(username=username)).first()
-    if user:
+    if UserProfile.objects.filter(Q(username=username)).exists():
         info = _('用户名已存在。')
         result['msg'] = info
         _log_event(request, 'front_register_failed', level="warning", username=username, reason='username_exists')
         return JsonResponse(result)
-    user = UserProfile(
-        username=username,
-        password=make_password(password1),
-        rid='',
-        uuid='',
-        rtype='',
-        deviceInfo='',
-        is_admin=True if UserProfile.objects.count() == 0 else False,
-        is_superuser=True if UserProfile.objects.count() == 0 else False,
-        is_active=True
-    )
-    user.save()
+    try:
+        UserProfile.objects.create_user(
+            username=username,
+            password=password1,
+            rid='',
+            uuid='',
+            rtype='',
+            deviceInfo='',
+            is_active=True,
+        )
+    except IntegrityError:
+        result['msg'] = _('用户名已存在。')
+        _log_event(request, 'front_register_failed', level="warning", username=username, reason='username_exists')
+        return JsonResponse(result, status=409)
     result['msg'] = info
     result['code'] = 1
     _log_event(request, 'front_register_success', username=username)

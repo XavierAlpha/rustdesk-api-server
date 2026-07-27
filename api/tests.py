@@ -1,9 +1,14 @@
 import hashlib
 import json
+from pathlib import Path
+import tempfile
 
 from django.test import TestCase, override_settings
+from nacl.signing import SigningKey
 
 from api.models import (
+    AuditSession,
+    ConnLog,
     DeviceGroup,
     LoginAttempt,
     OidcPendingAuth,
@@ -15,7 +20,7 @@ from api.models import (
 )
 
 
-class ApiContractTests(TestCase):
+class ApiTestMixin:
     def setUp(self):
         self.admin = UserProfile.objects.create_user(
             username="admin",
@@ -93,6 +98,8 @@ class ApiContractTests(TestCase):
         data.update(overrides)
         return RustDesDevice.objects.create(**data)
 
+
+class ApiContractTests(ApiTestMixin, TestCase):
     def test_login_requires_bearer_token_for_current_user(self):
         token = self._login("alice", "alice-pass")
 
@@ -166,17 +173,40 @@ class ApiContractTests(TestCase):
         self.assertEqual(response.json()["access_token"], "raw-token")
         self.assertFalse(OidcPendingAuth.objects.filter(state="test-state").exists())
 
-    def test_heartbeat_rejects_malformed_placeholder_ids(self):
+    def test_telemetry_requires_the_token_bound_to_that_device(self):
         response = self._post_json(
             "/api/heartbeat",
             {"id": "x" * 200, "uuid": "device-uuid"},
         )
-        self.assertEqual(response.json().get("error"), "ID_NOT_FOUND")
+        self.assertEqual(response.status_code, 400)
         self.assertFalse(RustDesDevice.objects.exists())
 
-        ok = self._post_json("/api/heartbeat", {"id": "123456789", "uuid": "device-uuid"})
-        self.assertEqual(ok.status_code, 200, ok.content)
+        token = self._login("alice", "alice-pass")
+        unauthenticated = self._post_json(
+            "/api/sysinfo",
+            {"id": "123456789", "uuid": "device-uuid", "hostname": "desktop"},
+        )
+        self.assertEqual(unauthenticated.status_code, 401)
+        wrong_device = self._post_json(
+            "/api/sysinfo",
+            {"id": "987654321", "uuid": "other-device", "hostname": "desktop"},
+            token=token,
+        )
+        self.assertEqual(wrong_device.status_code, 401)
+
+        sysinfo = self._post_json(
+            "/api/sysinfo",
+            {"id": "123456789", "uuid": "device-uuid", "hostname": "desktop"},
+            token=token,
+        )
+        self.assertEqual(sysinfo.status_code, 200, sysinfo.content)
         self.assertTrue(RustDesDevice.objects.filter(rid="123456789").exists())
+        heartbeat = self._post_json(
+            "/api/heartbeat",
+            {"id": "123456789", "uuid": "device-uuid"},
+            token=token,
+        )
+        self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
 
     def test_address_book_peers_match_flutter_client_contract(self):
         token = self._login("alice", "alice-pass")
@@ -252,7 +282,9 @@ class ApiContractTests(TestCase):
             "/api/login",
             {"username": "bob", "password": "bob-pass", "id": "800000001", "uuid": "bob-device"},
         )
-        self.assertEqual(denied.status_code, 403)
+        # Inactive and unknown accounts deliberately share the same response so
+        # the login endpoint does not become an account-status oracle.
+        self.assertEqual(denied.status_code, 401)
 
         enabled = self._post_json(f"/api/users/{user_guid}/enable", {}, token=admin_token)
         self.assertEqual(enabled.status_code, 200, enabled.content)
@@ -261,6 +293,7 @@ class ApiContractTests(TestCase):
     def test_device_groups_and_strategies_drive_heartbeat_contract(self):
         admin_token = self._login("admin", "admin-pass", rid="900000001", uuid="admin-device")
         self._device(owner=self.user)
+        device_token = self._login("alice", "alice-pass")
 
         created_group = self._post_json(
             "/api/device-groups",
@@ -297,6 +330,7 @@ class ApiContractTests(TestCase):
         heartbeat = self._post_json(
             "/api/heartbeat",
             {"id": "123456789", "uuid": "device-uuid", "modified_at": 0},
+            token=device_token,
         )
         self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
         self.assertEqual(heartbeat.json()["strategy"]["config_options"]["quality"], "best")
@@ -312,12 +346,16 @@ class ApiContractTests(TestCase):
         heartbeat = self._post_json(
             "/api/heartbeat",
             {"id": "123456789", "uuid": "device-uuid", "modified_at": 0},
+            token=device_token,
         )
         self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
         self.assertNotIn("strategy", heartbeat.json())
 
     def test_disabled_devices_are_blocked_by_login_and_heartbeat(self):
-        self._device(owner=self.user, is_active=False)
+        device = self._device(owner=self.user)
+        token = self._login("alice", "alice-pass")
+        device.is_active = False
+        device.save(update_fields=["is_active"])
 
         login = self._post_json(
             "/api/login",
@@ -333,15 +371,46 @@ class ApiContractTests(TestCase):
         heartbeat = self._post_json(
             "/api/heartbeat",
             {"id": "123456789", "uuid": "device-uuid"},
+            token=token,
         )
         self.assertEqual(heartbeat.status_code, 403)
 
     def test_plugin_sign_requires_configured_signing_key(self):
+        admin_token = self._login("admin", "admin-pass", rid="900000001", uuid="admin-device")
         response = self._post_json(
             "/lic/web/api/plugin-sign",
             {"msg": [1, 2, 3], "plugin_id": "sample", "version": "1.0.0"},
+            token=admin_token,
         )
         self.assertEqual(response.status_code, 503)
+
+    @override_settings(ALLOW_REGISTRATION=True)
+    def test_first_public_registration_never_bootstraps_an_administrator(self):
+        UserProfile.objects.all().delete()
+        response = self.client.post(
+            "/api/user_action?action=register",
+            {"user": "first-user", "pwd": "strong-pass"},
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["code"], 1)
+        user = UserProfile.objects.get(username="first-user")
+        self.assertFalse(user.is_admin)
+        self.assertFalse(user.is_superuser)
+
+    @override_settings(PLUGIN_SIGNING_KEY=SigningKey.generate().encode().hex())
+    def test_plugin_sign_is_an_admin_only_operation(self):
+        user_token = self._login("alice", "alice-pass")
+        admin_token = self._login("admin", "admin-pass", rid="900000001", uuid="admin-device")
+        payload = {"msg": [1, 2, 3], "plugin_id": "sample", "version": "1.0.0"}
+
+        self.assertEqual(self._post_json("/lic/web/api/plugin-sign", payload).status_code, 401)
+        self.assertEqual(
+            self._post_json("/lic/web/api/plugin-sign", payload, token=user_token).status_code,
+            403,
+        )
+        signed = self._post_json("/lic/web/api/plugin-sign", payload, token=admin_token)
+        self.assertEqual(signed.status_code, 200, signed.content)
+        self.assertEqual(len(signed.json()["signed_msg"]), 67)
 
     def test_device_group_delete_detaches_devices(self):
         admin_token = self._login("admin", "admin-pass", rid="900000001", uuid="admin-device")
@@ -411,7 +480,7 @@ class ApiContractTests(TestCase):
         self.assertEqual(home_response.context["summary"], {"total": 2, "online": 1, "offline": 0, "unknown": 1})
 
 
-class SessionIntegrityTests(ApiContractTests):
+class SessionIntegrityTests(ApiTestMixin, TestCase):
     """Regressions for defects that let a session outlive its owner's intent."""
 
     def test_logout_revokes_the_device_that_asked(self):
@@ -426,6 +495,12 @@ class SessionIntegrityTests(ApiContractTests):
         self.assertEqual(self._post_json("/api/currentUser", {}, token=desktop).status_code, 401)
         # ... and the phone, which never asked, is still signed in.
         self.assertEqual(self._post_json("/api/currentUser", {}, token=phone).status_code, 200)
+
+    def test_logout_cannot_revoke_a_device_by_public_identifiers(self):
+        token = self._login("alice", "alice-pass", rid="111111111", uuid="desktop")
+        denied = self._post_json("/api/logout", {"id": "111111111", "uuid": "desktop"})
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(self._post_json("/api/currentUser", {}, token=token).status_code, 200)
 
     def test_one_token_row_per_device(self):
         first = self._login("alice", "alice-pass", rid="111111111", uuid="desktop")
@@ -478,3 +553,141 @@ class SessionIntegrityTests(ApiContractTests):
                 **self._auth_headers(token),
             )
             self.assertEqual(response.status_code, 200, f"{query}: {response.content}")
+
+
+class SensitiveIngestionTests(ApiTestMixin, TestCase):
+    def _raw_record(self, query, body, token=None):
+        return self.client.post(
+            f"/api/record?{query}",
+            data=body,
+            content_type="application/octet-stream",
+            **self._auth_headers(token),
+        )
+
+    def test_record_upload_is_authenticated_sequential_and_device_isolated(self):
+        self._device(owner=self.user)
+        token = self._login("alice", "alice-pass")
+        with tempfile.TemporaryDirectory() as upload_root:
+            with self.settings(
+                RECORD_UPLOAD_ROOT=Path(upload_root),
+                RECORD_UPLOAD_MAX_CHUNK_BYTES=1024,
+                RECORD_UPLOAD_MAX_FILE_BYTES=2048,
+                DATA_UPLOAD_MAX_MEMORY_SIZE=1024,
+            ):
+                self.assertEqual(
+                    self._raw_record("type=new&file=session.webm", b"").status_code,
+                    401,
+                )
+                created = self._raw_record("type=new&file=session.webm", b"", token)
+                self.assertEqual(created.status_code, 200, created.content)
+                traversal = self._raw_record("type=new&file=../session.webm", b"", token)
+                self.assertEqual(traversal.status_code, 400)
+
+                first = self._raw_record(
+                    "type=part&file=session.webm&offset=0&length=4",
+                    b"data",
+                    token,
+                )
+                self.assertEqual(first.status_code, 200, first.content)
+                conflict = self._raw_record(
+                    "type=part&file=session.webm&offset=0&length=4",
+                    b"evil",
+                    token,
+                )
+                self.assertEqual(conflict.status_code, 409)
+
+                files = list(Path(upload_root).glob("*/session.webm"))
+                self.assertEqual(len(files), 1)
+                self.assertEqual(files[0].read_bytes(), b"data")
+
+    def test_audit_ingestion_and_notes_are_scoped_to_authenticated_participants(self):
+        self._device(owner=self.user, rid="111111111", uuid="host-device")
+        host_token = self._login("alice", "alice-pass", rid="111111111", uuid="host-device")
+        controller = UserProfile.objects.create_user(
+            username="bob",
+            password="bob-pass",
+            rid="",
+            uuid="",
+            rtype="",
+            deviceInfo="",
+        )
+        self._device(owner=controller, rid="222222222", uuid="controller-device")
+        controller_token = self._login(
+            "bob",
+            "bob-pass",
+            rid="222222222",
+            uuid="controller-device",
+        )
+        outsider = UserProfile.objects.create_user(
+            username="mallory",
+            password="mallory-pass",
+            rid="",
+            uuid="",
+            rtype="",
+            deviceInfo="",
+        )
+        self._device(owner=outsider, rid="333333333", uuid="outsider-device")
+        outsider_token = self._login(
+            "mallory",
+            "mallory-pass",
+            rid="333333333",
+            uuid="outsider-device",
+        )
+        new_event = {
+            "action": "new",
+            "id": "111111111",
+            "uuid": "host-device",
+            "conn_id": 7,
+            "session_id": 99,
+            "ip": "192.0.2.10",
+            "type": 0,
+        }
+
+        self.assertEqual(self._post_json("/api/audit/conn", new_event).status_code, 401)
+        created = self._post_json("/api/audit/conn", new_event, token=host_token)
+        self.assertEqual(created.status_code, 200, created.content)
+        updated = self._post_json(
+            "/api/audit/conn",
+            {
+                "id": "111111111",
+                "uuid": "host-device",
+                "conn_id": 7,
+                "session_id": 99,
+                "peer": ["222222222", "bob"],
+                "type": 0,
+            },
+            token=host_token,
+        )
+        self.assertEqual(updated.status_code, 200, updated.content)
+        self.assertEqual(ConnLog.objects.get().from_id, "222222222")
+
+        active = self.client.get(
+            "/api/audit/conn/active?id=111111111&session_id=99&conn_type=0",
+            **self._auth_headers(controller_token),
+        )
+        self.assertEqual(active.status_code, 200, active.content)
+        guid = active.json()
+        self.assertTrue(guid)
+        session = AuditSession.objects.get(guid=guid)
+        self.assertEqual(session.actor_id, controller.id)
+
+        direct_note = self._post_json(
+            "/api/audit/conn",
+            {"id": "111111111", "session_id": 99, "note": "during session"},
+            token=controller_token,
+        )
+        self.assertEqual(direct_note.status_code, 200, direct_note.content)
+        denied = self._put_json(
+            "/api/audit",
+            {"guid": guid, "note": "tampered"},
+            token=outsider_token,
+        )
+        self.assertEqual(denied.status_code, 404)
+        allowed = self._put_json(
+            "/api/audit",
+            {"guid": guid, "note": "approved"},
+            token=controller_token,
+        )
+        self.assertEqual(allowed.status_code, 200, allowed.content)
+        session.refresh_from_db()
+        self.assertEqual(session.note, "approved")

@@ -17,7 +17,7 @@ urlpatterns = [
     url(r'^record$', csrf_exempt(views_api.record)),
     url(r'^devices/cli$', csrf_exempt(views_api.devices_cli)),
     url(r'^devices/deploy$', csrf_exempt(views_api.devices_deploy)),
-    url(r'^audit/(?P<typ>.+)$', csrf_exempt(views_api.audit_with_type)),
+    url(r'^audit/(?P<typ>conn/active|conn|file|alarm)$', csrf_exempt(views_api.audit_with_type)),
     url(r'^audit$', csrf_exempt(views_api.audit_root)),
 
     url(r'^ab/settings$', csrf_exempt(views_api.ab_settings)),

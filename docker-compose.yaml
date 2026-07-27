@@ -11,8 +11,11 @@ services:
       DEBUG: "false"
       LOG_LEVEL: "INFO"
       LANGUAGE_CODE: "zh-hans"
-      ALLOW_REGISTRATION: "true"
+      ALLOW_REGISTRATION: "false"
+      ALLOWED_HOSTS: "api.example.com"
       CSRF_TRUSTED_ORIGINS: "https://api.example.com,https://admin.example.com"
+      SECURE_TLS: "true"
+      TRUST_PROXY_HEADERS: "true"
 
       # Web client connection defaults:
       # - ID service default port = DEFAULT_ID_PORT

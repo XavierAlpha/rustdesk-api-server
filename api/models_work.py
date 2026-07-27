@@ -305,6 +305,13 @@ class AuditSession(models.Model):
     guid = models.CharField(verbose_name='GUID', max_length=64, unique=True)
     peer_id = models.CharField(verbose_name='Peer ID', max_length=20, db_index=True)
     session_id = models.CharField(verbose_name='Session ID', max_length=60, db_index=True)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='audit_sessions',
+    )
     conn_type = models.IntegerField(verbose_name='Conn Type', default=0)
     note = models.TextField(verbose_name='Note', blank=True, default='')
     created_at = models.DateTimeField(verbose_name='Created At', default=timezone.now)
@@ -314,6 +321,12 @@ class AuditSession(models.Model):
         ordering = ('-created_at',)
         verbose_name = _("审计会话")
         verbose_name_plural = _("审计会话列表")
+        constraints = [
+            models.UniqueConstraint(
+                fields=['peer_id', 'session_id'],
+                name='unique_audit_session_per_connection',
+            ),
+        ]
 
     def __str__(self):
         return self.guid or f"Audit {self.pk}"
