@@ -17,6 +17,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: api-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   quality:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
@@ -28,6 +32,7 @@ jobs:
       ALLOWED_HOSTS: "127.0.0.1,localhost"
       CSRF_TRUSTED_ORIGINS: "http://127.0.0.1:21114"
       SQLITE_DB_PATH: /tmp/camellia-api.sqlite3
+      DEVICE_VERIFICATION_TOKEN: ci-device-verification-token-with-sufficient-length
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -39,7 +44,7 @@ jobs:
           cache-dependency-glob: uv.lock
 
       - name: Install dependencies
-        run: uv sync --all-groups
+        run: uv sync --locked --all-groups
 
       - name: Static analysis
         run: |
@@ -55,8 +60,94 @@ jobs:
         env:
           DEBUG: "false"
           SECRET_KEY: ci-only-production-secret-key-with-sufficient-length-000
+          DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          DEVICE_VERIFICATION_TOKEN: ci-device-verification-token-with-sufficient-length
           SECURE_TLS: "true"
         run: uv run python manage.py check --deploy
 
+      - name: Fresh database migration
+        env:
+          SQLITE_DB_PATH: /tmp/camellia-api-migration-smoke.sqlite3
+        run: uv run python manage.py migrate --noinput
+
       - name: Tests
-        run: uv run python -m pytest
+        run: uv run python -m pytest --create-db
+
+  container:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build runtime image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          push: false
+          tags: camellia-api-server:ci
+
+      - name: Create smoke-test volumes
+        run: |
+          docker volume create camellia-api-ci-db
+          docker volume create camellia-api-ci-records
+
+      - name: Migrate container database
+        run: |
+          docker run --rm \
+            -e DEBUG=false \
+            -e SECRET_KEY=ci-only-production-secret-key-with-sufficient-length-000 \
+            -e DATA_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+            -e DEVICE_VERIFICATION_TOKEN=ci-device-verification-token-with-sufficient-length \
+            -e ALLOWED_HOSTS=127.0.0.1,localhost \
+            -e CSRF_TRUSTED_ORIGINS=https://api.example.test \
+            -e SECURE_TLS=true \
+            -v camellia-api-ci-db:/camellia-server/db \
+            -v camellia-api-ci-records:/camellia-server/records \
+            camellia-api-server:ci \
+            python manage.py migrate --noinput
+
+      - name: Start hardened container
+        run: |
+          docker run -d \
+            --name camellia-api-ci \
+            --read-only \
+            --tmpfs /tmp:size=128m,mode=1777 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            -e DEBUG=false \
+            -e SECRET_KEY=ci-only-production-secret-key-with-sufficient-length-000 \
+            -e DATA_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+            -e DEVICE_VERIFICATION_TOKEN=ci-device-verification-token-with-sufficient-length \
+            -e ALLOWED_HOSTS=127.0.0.1,localhost \
+            -e CSRF_TRUSTED_ORIGINS=https://api.example.test \
+            -e SECURE_TLS=true \
+            -e GUNICORN_WORKERS=1 \
+            -v camellia-api-ci-db:/camellia-server/db \
+            -v camellia-api-ci-records:/camellia-server/records \
+            camellia-api-server:ci
+
+      - name: Verify container readiness
+        run: |
+          for attempt in $(seq 1 30); do
+            if docker exec camellia-api-ci python -c \
+              'import json, urllib.request; request = urllib.request.Request("http://127.0.0.1:21114/health/ready", headers={"X-Forwarded-Proto": "https"}); response = urllib.request.urlopen(request, timeout=2); assert response.status == 200 and json.load(response)["status"] == "ready"'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs camellia-api-ci
+          exit 1
+
+      - name: Clean up container resources
+        if: always()
+        run: |
+          docker rm --force camellia-api-ci 2>/dev/null || true
+          docker volume rm camellia-api-ci-db camellia-api-ci-records 2>/dev/null || true

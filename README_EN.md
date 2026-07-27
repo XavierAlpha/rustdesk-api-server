@@ -11,7 +11,7 @@ Camellia API Server is the management and coordination service used by the Camel
 
 ## Requirements
 
-- Python 3.14
+- Python 3.13+ (CI and the container use Python 3.14)
 - Django 6
 - SQLite or MySQL 8+
 - Optional: Docker 25+ / Docker Compose v2
@@ -20,26 +20,25 @@ Camellia API Server is the management and coordination service used by the Camel
 
 ```bash
 cd camellia-api-server
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-dev.txt
+uv sync --locked --all-groups
 
 export DEBUG=true
-export SECRET_KEY=dev-only-secret
-python manage.py migrate
-python manage.py createsuperuser
-python manage.py runserver 0.0.0.0:21114
+uv run python manage.py migrate
+uv run python manage.py createsuperuser
+uv run python manage.py runserver 0.0.0.0:21114
 ```
 
 Quality checks:
 
 ```bash
-python -m compileall api webui2 rustdesk_server_api
-python -m ruff check api webui2 rustdesk_server_api
-python manage.py check
-python manage.py makemigrations --check --dry-run
-python -m pytest
+uv run python -m compileall api webui2 rustdesk_server_api
+uv run ruff check api webui2 rustdesk_server_api
+uv run python manage.py check
+uv run python manage.py makemigrations --check --dry-run
+uv run pytest --create-db
 ```
+
+Because this project has not launched, the migration history is deliberately compressed into one `api/0001_initial.py`. Deploy only to an empty database; an old development database is not a supported production upgrade source.
 
 ## Production Environment
 
@@ -47,19 +46,25 @@ python -m pytest
 | --- | --- | --- |
 | `DEBUG` | `false` | Keep disabled in production. |
 | `SECRET_KEY` | unset | Required when `DEBUG=false`; use a strong random value. |
+| `DATA_ENCRYPTION_KEY` | unset | Required; a canonical Base64-encoded 32-byte key used for sensitive fields. Encrypted data is unrecoverable if this key is lost. |
+| `DEVICE_VERIFICATION_TOKEN` | unset | Required; a 32–512 character secret without whitespace. It must exactly match the RustDesk Server variable of the same name. |
 | `ALLOWED_HOSTS` | `127.0.0.1,localhost` | Allowed Django hosts. |
 | `CSRF_TRUSTED_ORIGINS` | `http://127.0.0.1:21114` | Public or reverse-proxy origins. |
 | `SECURE_TLS` | `false` | Production HTTPS mode: secure cookies, proxy scheme handling, HTTPS redirects, and HSTS. |
 | `SECURE_HSTS_SECONDS` | `31536000` in TLS mode | HSTS lifetime; enable only after the hostname is permanently HTTPS-only. |
-| `SECURE_HSTS_INCLUDE_SUBDOMAINS` | `true` in TLS mode | Applies HSTS to child hostnames; explicitly disable for mixed-HTTP domains. |
-| `SECURE_HSTS_PRELOAD` | `true` in TLS mode | Emits the HSTS preload directive; review the domain policy before preload-list submission. |
+| `SECURE_HSTS_INCLUDE_SUBDOMAINS` | `false` | Applies HSTS to child hostnames; enable only after the entire child namespace is permanently HTTPS-only. |
+| `SECURE_HSTS_PRELOAD` | `false` | Emits the HSTS preload directive; enable only when the domain is ready for preload-list submission. |
 | `TRUST_PROXY_HEADERS` | `false` | Enable only when the front proxy overwrites client forwarding headers. |
+| `TRUSTED_PROXY_CIDRS` | empty | Required with trusted proxy headers; only these direct proxy networks may supply client-address headers. |
 | `LANGUAGE_CODE` | `zh-hans` | `zh-hans` or `en`. |
 | `TIME_ZONE` | `Asia/Shanghai` | Django time zone. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. |
 | `PORT` | `21114` | Gunicorn listen port. |
 | `HOST` | `0.0.0.0` | Gunicorn bind host. |
 | `GUNICORN_WORKERS` | `2` | Gunicorn worker count. |
+| `GUNICORN_THREADS` | `2` | Thread count per worker. |
+| `GUNICORN_FORWARDED_ALLOW_IPS` | `127.0.0.1` | Proxy source addresses from which Gunicorn accepts scheme headers. |
+| `RUN_MIGRATIONS` | `false` | Runs migrations before startup. Prefer a dedicated one-off migration task. |
 | `ALLOW_REGISTRATION` | `false` | Enables public registration; registered accounts are always regular users. |
 | `PLUGIN_SIGNING_KEY` | unset | 32-byte Ed25519 signing key in base64 or hex. The signing endpoint returns 503 when unset. |
 | `RECORD_UPLOAD_MAX_CHUNK_BYTES` | `4194304` | Maximum bytes accepted by one recording upload request. |
@@ -74,16 +79,19 @@ Create the first administrator explicitly with `python manage.py createsuperuser
 | --- | --- | --- |
 | `DATABASE_TYPE` | `SQLITE` | `SQLITE` or `MYSQL`. |
 | `SQLITE_DB_PATH` | `db/db.sqlite3` | SQLite file path. |
+| `SQLITE_BUSY_TIMEOUT_SECONDS` | `20` | SQLite write-lock wait limit. |
 | `MYSQL_DBNAME` | `-` | MySQL database name. |
 | `MYSQL_HOST` | `127.0.0.1` | MySQL host. |
 | `MYSQL_USER` | `-` | MySQL user. |
 | `MYSQL_PASSWORD` | `-` | MySQL password. |
 | `MYSQL_PORT` | `3306` | MySQL port. |
+| `DATABASE_CONN_MAX_AGE` | `60` | MySQL persistent-connection lifetime. |
+| `DATABASE_CONNECT_TIMEOUT` | `10` | MySQL connection timeout. |
 
-The default dependency set targets SQLite. Install the optional MySQL driver only when MySQL is used:
+SQLite uses WAL, `IMMEDIATE` transactions, and a busy timeout. It is intended for one API application instance. Use MySQL for multiple replicas or sustained write-heavy workloads. Install its optional driver with:
 
 ```bash
-pip install -r requirements-mysql.txt
+uv sync --locked --extra mysql
 ```
 
 ### Server and Web Client Coordination
@@ -91,7 +99,7 @@ pip install -r requirements-mysql.txt
 | Variable | Default | Description |
 | --- | --- | --- |
 | `ID_SERVER` | empty | Rendezvous server list, separated by comma, semicolon, whitespace, or newline. |
-| `RELAY_SERVER` | empty | Relay server list. When empty, it is derived from `ID_SERVER` and the port rules. |
+| `RELAY_SERVER` | empty | Relay server list. When empty, it is safely derived from `ID_SERVER` and its port rules. |
 | `DEFAULT_ID_PORT` | `21116` | Base ID service port. |
 | `API_SERVER` | empty | API URL exposed to the Web client. |
 | `RS_PUB_KEY` | empty | RustDesk Server public key; must match the server `RS_PRIV_KEY`. |
@@ -102,24 +110,27 @@ pip install -r requirements-mysql.txt
 | `OIDC_REDIRECT_URI` | empty | OIDC callback URL, usually `https://api.example.com/api/oidc/callback`. |
 | `OIDC_SCOPE` | `openid email profile` | OIDC scope. |
 
+A native endpoint is `remote.example.com:21116`; a direct browser WS endpoint is `ws://remote.example.com:21118`. HTTPS pages must use WSS. Configure `wss://remote.example.com:443` explicitly and route `/ws/id` and `/ws/relay` on that origin to RustDesk Server ports `21118` and `21119`. Writing `:443` explicitly prevents the endpoint from being interpreted as a custom WebSocket port.
+
 ## Docker
 
+Compose is the recommended deployment path. Copy the environment template, generate three independent secrets, and fill in the public endpoints and server key. Back up the secrets with the database and never rotate them accidentally.
+
 ```bash
-docker build -t camellia-api-server:latest .
-docker run -d \
-  --name camellia-api-server \
-  -p 21114:21114 \
-  -e SECRET_KEY='<strong-random-secret>' \
-  -e ALLOWED_HOSTS='api.example.com' \
-  -e CSRF_TRUSTED_ORIGINS='https://api.example.com' \
-  -e ID_SERVER='wss://id.example.com' \
-  -e API_SERVER='https://api.example.com' \
-  -e RS_PUB_KEY='<server-public-key>' \
-  -v /data/camellia-api/db:/camellia-server/db \
-  -v /data/camellia-api/records:/camellia-server/records \
-  --restart unless-stopped \
-  camellia-api-server:latest
+cp .env.example .env
+python -c 'import secrets; print(secrets.token_urlsafe(64))'
+python -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())'
+
+docker compose build
+docker compose run --rm camellia-server python manage.py migrate --noinput
+docker compose run --rm camellia-server python manage.py createsuperuser
+docker compose up -d
+docker compose ps
 ```
+
+Compose binds the API only to host `127.0.0.1:21114` by default. The container runs as a non-root user with a read-only root filesystem, all Linux capabilities removed, and named `camellia-db` and `camellia-records` volumes for persistent data. `/health/live` reports process liveness; `/health/ready` also verifies required configuration, database connectivity, and the migrated core table.
+
+The reverse proxy must overwrite, not append, `X-Forwarded-For` and `X-Forwarded-Proto`. Set `GUNICORN_FORWARDED_ALLOW_IPS` to the proxy source address observed by the container and retain `127.0.0.1` for the internal readiness probe, for example `127.0.0.1,172.17.0.1`. If real client addresses are needed, also enable `TRUST_PROXY_HEADERS` and put that trusted network in `TRUSTED_PROXY_CIDRS`. A proxy on the Docker host normally reaches the container from a bridge gateway address, not `127.0.0.1`.
 
 Build a MySQL-capable image:
 
@@ -131,11 +142,11 @@ See [docker-compose.yaml](docker-compose.yaml) for a Compose example.
 
 ## Web Client Assets
 
-`static/web_client` is the release asset directory. It is built from `rustdesk/flutter/web/tools` in the client repository and copied into this project. Do not commit `static/web_client/js/node_modules`; keep only runtime assets and bridge output.
+The only Web source tree is `rustdesk/flutter/web` in the client repository. This repository's `static/web_client` contains only Flutter release output and the compiled bridge. After building the client, run `./sync_web_client.sh ../rustdesk/flutter/build/web`; it validates required files, atomically replaces the runtime assets, and strips source, package-manager files, and build tools.
 
 ## CI
 
 The repository contains two workflows:
 
-- `API Server CI`: compile checks, Ruff, Django checks, migration checks, and tests.
-- `API Server Docker`: manually triggered image build and optional GHCR / Docker Hub publishing with selectable target platforms.
+- `API Server CI`: locked dependency installation, compilation, Ruff, development and production Django checks, migration drift detection, an empty-database migration, the complete test suite, and a readiness probe against a read-only non-root container.
+- `API Server Docker`: manually triggered multi-architecture build with optional GHCR or Docker Hub publishing and optional MySQL support; published images include maximal provenance and SBOM attestations.

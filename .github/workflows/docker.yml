@@ -36,7 +36,10 @@ on:
 
 permissions:
   contents: read
-  packages: write
+
+concurrency:
+  group: api-image-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -63,11 +66,16 @@ jobs:
           platforms: ${{ inputs.platforms }}
           push: false
           tags: camellia-api-server:ci
+          cache-from: type=gha,scope=api-image-${{ inputs.install_mysql }}
+          cache-to: type=gha,scope=api-image-${{ inputs.install_mysql }},mode=max
 
   publish-ghcr:
     if: ${{ inputs.publish_ghcr }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -107,14 +115,27 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=api-image-${{ inputs.install_mysql }}
+          cache-to: type=gha,scope=api-image-${{ inputs.install_mysql }},mode=max
+          provenance: mode=max
+          sbom: true
 
   publish-dockerhub:
-    if: ${{ inputs.publish_dockerhub && inputs.dockerhub_image != '' }}
+    if: ${{ inputs.publish_dockerhub }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Validate Docker Hub image
+        env:
+          DOCKERHUB_IMAGE: ${{ inputs.dockerhub_image }}
+        run: |
+          if [ -z "$DOCKERHUB_IMAGE" ]; then
+            echo "dockerhub_image is required when Docker Hub publishing is enabled" >&2
+            exit 1
+          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -150,3 +171,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=api-image-${{ inputs.install_mysql }}
+          cache-to: type=gha,scope=api-image-${{ inputs.install_mysql }},mode=max
+          provenance: mode=max
+          sbom: true

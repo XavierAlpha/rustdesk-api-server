@@ -1,49 +1,103 @@
-version: "3.8"
 services:
   camellia-server:
     container_name: camellia-server
     build:
       context: .
+      args:
+        INSTALL_MYSQL: "${INSTALL_MYSQL:-false}"
     environment:
       HOST: "0.0.0.0"
-      TZ: "Asia/Shanghai"
-      SECRET_KEY: "<replace-with-a-long-random-secret>"
+      PORT: "21114"
+      TZ: "${TZ:-Asia/Singapore}"
+      TIME_ZONE: "${TIME_ZONE:-Asia/Singapore}"
+      SECRET_KEY: "${SECRET_KEY:?Set SECRET_KEY to at least 50 random characters}"
+      DATA_ENCRYPTION_KEY: "${DATA_ENCRYPTION_KEY:?Set the 32-byte Base64 data encryption key}"
+      DEVICE_VERIFICATION_TOKEN: "${DEVICE_VERIFICATION_TOKEN:?Set the shared device verification token}"
       DEBUG: "false"
-      LOG_LEVEL: "INFO"
-      LANGUAGE_CODE: "zh-hans"
-      ALLOW_REGISTRATION: "false"
-      ALLOWED_HOSTS: "api.example.com"
-      CSRF_TRUSTED_ORIGINS: "https://api.example.com,https://admin.example.com"
-      SECURE_TLS: "true"
-      TRUST_PROXY_HEADERS: "true"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      LANGUAGE_CODE: "${LANGUAGE_CODE:-zh-hans}"
+      ALLOW_REGISTRATION: "${ALLOW_REGISTRATION:-false}"
+      ALLOWED_HOSTS: "${ALLOWED_HOSTS:?Set the public API hostname}"
+      CSRF_TRUSTED_ORIGINS: "${CSRF_TRUSTED_ORIGINS:?Set the public HTTPS origin}"
+      SECURE_TLS: "${SECURE_TLS:-true}"
+      SECURE_HSTS_SECONDS: "${SECURE_HSTS_SECONDS:-31536000}"
+      SECURE_HSTS_INCLUDE_SUBDOMAINS: "${SECURE_HSTS_INCLUDE_SUBDOMAINS:-false}"
+      SECURE_HSTS_PRELOAD: "${SECURE_HSTS_PRELOAD:-false}"
+      SESSION_COOKIE_AGE_SECONDS: "${SESSION_COOKIE_AGE_SECONDS:-28800}"
+      TRUST_PROXY_HEADERS: "${TRUST_PROXY_HEADERS:-false}"
+      TRUSTED_PROXY_CIDRS: "${TRUSTED_PROXY_CIDRS:-}"
+      GUNICORN_FORWARDED_ALLOW_IPS: "${GUNICORN_FORWARDED_ALLOW_IPS:-127.0.0.1}"
+      GUNICORN_WORKERS: "${GUNICORN_WORKERS:-2}"
+      GUNICORN_THREADS: "${GUNICORN_THREADS:-2}"
+      GUNICORN_TIMEOUT_SECONDS: "${GUNICORN_TIMEOUT_SECONDS:-60}"
+      GUNICORN_GRACEFUL_TIMEOUT_SECONDS: "${GUNICORN_GRACEFUL_TIMEOUT_SECONDS:-30}"
+      GUNICORN_KEEP_ALIVE_SECONDS: "${GUNICORN_KEEP_ALIVE_SECONDS:-5}"
+      GUNICORN_MAX_REQUESTS: "${GUNICORN_MAX_REQUESTS:-1000}"
+      GUNICORN_MAX_REQUESTS_JITTER: "${GUNICORN_MAX_REQUESTS_JITTER:-100}"
+      RUN_MIGRATIONS: "${RUN_MIGRATIONS:-false}"
 
-      # Web client connection defaults:
-      # - ID service default port = DEFAULT_ID_PORT
-      # - Relay default = DEFAULT_ID_PORT + 1
-      # - WebSocket ID default = DEFAULT_ID_PORT + 2
-      # - WebSocket relay default = DEFAULT_ID_PORT + 3
-      DEFAULT_ID_PORT: "52116"
+      DEFAULT_ID_PORT: "${DEFAULT_ID_PORT:-21116}"
+      ID_SERVER: "${ID_SERVER:?Set one or more WSS rendezvous endpoints}"
+      RELAY_SERVER: "${RELAY_SERVER:-}"
+      API_SERVER: "${API_SERVER:?Set the public HTTPS API URL}"
+      RS_PUB_KEY: "${RS_PUB_KEY:?Set the rendezvous server public key}"
+      PLUGIN_SIGNING_KEY: "${PLUGIN_SIGNING_KEY:-}"
 
-      # Multi-value supported: comma/semicolon/space/newline.
-      # Recommended production (HTTPS page): wss://...
-      ID_SERVER: "wss://id-a.example.com,wss://id-b.example.com"
-
-      # Optional. Keep empty to auto-derive from ID_SERVER.
-      RELAY_SERVER: ""
-
-      # API endpoint shown to web client settings page.
-      API_SERVER: "https://api.example.com"
-
-      # Required: public key matching rustdesk-server RS_PRIV_KEY.
-      RS_PUB_KEY: "<replace-with-base64-pubkey>"
-
-      DATABASE_TYPE: "SQLITE"
+      DATABASE_TYPE: "${DATABASE_TYPE:-SQLITE}"
       SQLITE_DB_PATH: "/camellia-server/db/db.sqlite3"
+      SQLITE_BUSY_TIMEOUT_SECONDS: "${SQLITE_BUSY_TIMEOUT_SECONDS:-20}"
+      MYSQL_DBNAME: "${MYSQL_DBNAME:--}"
+      MYSQL_HOST: "${MYSQL_HOST:-127.0.0.1}"
+      MYSQL_USER: "${MYSQL_USER:--}"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD:--}"
+      MYSQL_PORT: "${MYSQL_PORT:-3306}"
+      DATABASE_CONN_MAX_AGE: "${DATABASE_CONN_MAX_AGE:-60}"
+      DATABASE_CONNECT_TIMEOUT: "${DATABASE_CONNECT_TIMEOUT:-10}"
+
+      RECORD_UPLOAD_ROOT: "/camellia-server/records"
+      RECORD_UPLOAD_MAX_CHUNK_BYTES: "${RECORD_UPLOAD_MAX_CHUNK_BYTES:-4194304}"
+      RECORD_UPLOAD_MAX_FILE_BYTES: "${RECORD_UPLOAD_MAX_FILE_BYTES:-10737418240}"
+
+      OIDC_NAME: "${OIDC_NAME:-}"
+      OIDC_ISSUER: "${OIDC_ISSUER:-}"
+      OIDC_CLIENT_ID: "${OIDC_CLIENT_ID:-}"
+      OIDC_CLIENT_SECRET: "${OIDC_CLIENT_SECRET:-}"
+      OIDC_REDIRECT_URI: "${OIDC_REDIRECT_URI:-}"
+      OIDC_ALLOWED_HOSTS: "${OIDC_ALLOWED_HOSTS:-}"
+      OIDC_SCOPE: "${OIDC_SCOPE:-openid email profile}"
+      OIDC_HTTP_TIMEOUT_SECONDS: "${OIDC_HTTP_TIMEOUT_SECONDS:-10}"
     volumes:
-      - ./db:/camellia-server/db
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
-    network_mode: bridge
+      - camellia-db:/camellia-server/db
+      - camellia-records:/camellia-server/records
     ports:
-      - "21114:21114"
+      - "127.0.0.1:${API_BIND_PORT:-21114}:21114"
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json, urllib.request;
+          request = urllib.request.Request(
+          "http://127.0.0.1:21114/health/ready",
+          headers={"X-Forwarded-Proto": "https"});
+          response = urllib.request.urlopen(request, timeout=3);
+          assert response.status == 200 and json.load(response)["status"] == "ready"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 45s
     restart: unless-stopped
+
+volumes:
+  camellia-db:
+  camellia-records:
