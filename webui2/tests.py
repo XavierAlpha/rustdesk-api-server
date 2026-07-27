@@ -1,5 +1,12 @@
-from django.test import SimpleTestCase, override_settings
+import json
+import re
+from pathlib import Path
 
+from django.conf import settings
+from django.contrib.staticfiles import finders
+from django.test import SimpleTestCase, TestCase, override_settings
+
+from api.models import UserProfile
 from webui2.views import (
     _normalize_relay_server,
     _normalize_rendezvous_server,
@@ -76,3 +83,91 @@ class WebClientServerConfigurationTests(SimpleTestCase):
             _normalize_relay_server("relay.example.com/path"),
             "",
         )
+
+
+class WebClientRuntimeTests(TestCase):
+    @property
+    def runtime_root(self):
+        return Path(settings.BASE_DIR) / "static" / "web_client"
+
+    def test_runtime_bundle_excludes_build_tooling(self):
+        required_files = (
+            "flutter_bootstrap.js",
+            "main.dart.js",
+            "manifest.json",
+            "canvaskit/canvaskit.wasm",
+            "js/dist/web_bridge.js",
+        )
+        for relative_path in required_files:
+            with self.subTest(relative_path=relative_path):
+                self.assertTrue((self.runtime_root / relative_path).is_file())
+
+        forbidden_paths = (
+            "js/node_modules",
+            "js/src",
+            "js/tools",
+            "js/package.json",
+            "js/package-lock.json",
+            "js/tsconfig.json",
+            "js/vite.config.ts",
+        )
+        for relative_path in forbidden_paths:
+            with self.subTest(relative_path=relative_path):
+                self.assertFalse((self.runtime_root / relative_path).exists())
+
+    def test_bootstrap_has_one_complete_javascript_target(self):
+        bootstrap = (self.runtime_root / "flutter_bootstrap.js").read_text()
+        match = re.search(r"_flutter\.buildConfig = (\{[^\n]+\});", bootstrap)
+        self.assertIsNotNone(match)
+        config = json.loads(match.group(1))
+        self.assertEqual(
+            config["builds"],
+            [
+                {
+                    "compileTarget": "dart2js",
+                    "renderer": "canvaskit",
+                    "mainJsPath": "main.dart.js",
+                }
+            ],
+        )
+        self.assertNotIn("sourceMappingURL=", bootstrap)
+        self.assertNotIn(
+            "sourceMappingURL=",
+            (self.runtime_root / "flutter.js").read_text(),
+        )
+
+    def test_admin_assets_use_the_framework_version_without_shadowing(self):
+        self.assertEqual(
+            len(finders.find("admin/css/base.css", find_all=True)),
+            1,
+        )
+        self.assertEqual(
+            len(finders.find("camellia_admin/admin.css", find_all=True)),
+            1,
+        )
+
+    @override_settings(
+        STORAGES={
+            "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+            "staticfiles": {
+                "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"
+            },
+        }
+    )
+    def test_entrypoint_is_nonce_bound_without_unsafe_eval(self):
+        user = UserProfile.objects.create_user(
+            username="web-client-user",
+            password="test-password",
+        )
+        self.client.force_login(user)
+
+        response = self.client.get("/webui2/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "/static/web_client/js/dist/web_bridge.js")
+        self.assertContains(response, "/static/web_client/flutter_bootstrap.js")
+        csp = response.headers.get("Content-Security-Policy", "")
+        self.assertIn("script-src", csp)
+        self.assertIn("'nonce-", csp)
+        self.assertIn("'wasm-unsafe-eval'", csp)
+        self.assertNotIn("'unsafe-eval'", csp)

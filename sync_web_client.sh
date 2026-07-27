@@ -51,10 +51,26 @@ rm -rf -- \
   "$STAGING/js/README.md" \
   "$STAGING/js/node_modules" \
   "$STAGING/js/src" \
+  "$STAGING/js/tools" \
   "$STAGING/js/package.json" \
   "$STAGING/js/package-lock.json" \
   "$STAGING/js/tsconfig.json" \
   "$STAGING/js/vite.config.ts"
+
+if [[ -f "$STAGING/assets/NOTICES" ]]; then
+  sed -i 's/[[:blank:]]\+$//' "$STAGING/assets/NOTICES"
+fi
+
+# Flutter embeds flutter.js into the bootstrap but leaves a source-map comment
+# even when release builds do not publish the map. WhiteNoise treats the
+# dangling comment as a required static dependency, so remove it from both
+# emitted copies.
+for generated_js in flutter.js flutter_bootstrap.js; do
+  if [[ -f "$STAGING/$generated_js" ]]; then
+    sed -i '/^[[:blank:]]*\/\/[#@][[:blank:]]*sourceMappingURL=.*$/d' \
+      "$STAGING/$generated_js"
+  fi
+done
 
 required_files=(
   "flutter_bootstrap.js"

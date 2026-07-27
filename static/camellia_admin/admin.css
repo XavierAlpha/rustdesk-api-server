@@ -1,3 +1,4 @@
+/* Camellia overrides for Django's versioned Admin assets. */
 :root {
   --bg-start: #f5f6fb;
   --bg-end: #e9eef6;
