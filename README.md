@@ -152,11 +152,13 @@ git -C ../rustdesk checkout "$(./scripts/web_client_revision.sh)"
 
 脚本会调用客户端的规范 release 构建，要求本地仓库和产物来源都与锁定 commit 完全一致，并校验 clean 来源标记后原子替换运行资产，同时剔除源码、包管理文件和构建工具。同步已有产物时必须显式使用 `--source ../rustdesk/flutter/build/web`；来源不明、dirty 或版本未锁定的产物都会被拒绝。更新 Web 时，应先提交并推送 RustDesk，再把 `web-client.lock` 改为该完整 commit；无需提交生成目录。
 
-CI 只访问与 API 仓库相同 GitHub owner 下的 RustDesk 仓库。仓库名默认是 `rustdesk`；如仓库改名，在 API 仓库中设置 Actions repository variable `RUSTDESK_REPOSITORY_NAME` 即可。变量只能是单一仓库名，不能包含 owner 或 `/`，因此不会跨账户取源码。
+CI 只访问与 API 仓库相同 GitHub owner 下的 RustDesk 仓库。仓库名默认是 `rustdesk`；如仓库改名，在 API 仓库中设置 Actions repository variable `RUSTDESK_REPOSITORY_NAME` 即可。变量只能是单一仓库名，不能包含 owner 或 `/`，因此不会跨账户取源码。锁定 commit 还必须可从该仓库默认分支到达，并已有成功的 push `CI / Required`；未审阅分支或未通过客户端 CI 的 commit 不能进入 API 镜像。
 
 ## CI
 
 仓库包含两个 workflow：
 
-- `API Server CI`：从同 owner 仓库构建 `web-client.lock` 锁定的 Web commit，并让质量检查与容器检查复用同一 artifact；随后执行锁文件安装、编译、Ruff、开发/生产 Django check、迁移漂移检查、空数据库迁移、完整测试，以及只读非 root 容器的就绪探针。
-- `API Server Docker`：每次手动运行只构建一次锁定的 Web runtime，所有选中的多架构构建/发布任务复用它；可选择发布到 GHCR 或 Docker Hub、启用 MySQL 驱动，发布镜像附带最大化 provenance 与 SBOM attestations。
+- `CI`：PR、`master` push 与手动重跑共用同一入口。纯文档变更只运行分类、版本一致性与稳定的 `CI / Required` 门禁；代码变更从同 owner 仓库构建或恢复 `web-client.lock` 锁定的 Web cache，质量检查和容器检查复用同一 artifact。依赖 PR 额外执行 dependency graph delta 审查。完整检查包括锁文件安装与审计、编译、Ruff、开发/生产 Django check、迁移漂移、空数据库迁移、测试，以及只读非 root 容器就绪探针。
+- `Release`：只允许手动选择默认分支可达的 ref。它要求该精确 commit 已有成功的 push `CI`，复用其中未过期的 Web artifact，不重跑测试、不重编 Web；随后只执行一次多架构镜像构建，可把同一 digest 推送到 GHCR 和/或 Docker Hub。`publish=false` 是安全的默认演练，正式发布通过 `release` environment 审批后创建由组件版本派生的 `vMAJOR.MINOR.PATCH` tag、GitHub Release 与可追溯 manifest。
+
+API 版本独立于客户端和服务端。发布前同时更新 `pyproject.toml`、`uv.lock` 中的虚拟项目版本和 `version.py`，并运行 `python scripts/release_metadata.py`；CI 会拒绝不一致、非稳定 SemVer 或重复的发布 tag。Web artifact 保留 14 天，超过期限时应重跑对应的 push CI run，再发起发布。
