@@ -92,6 +92,7 @@ class WebClientRuntimeTests(TestCase):
 
     def test_runtime_bundle_excludes_build_tooling(self):
         required_files = (
+            ".source_revision",
             "flutter_bootstrap.js",
             "main.dart.js",
             "manifest.json",
@@ -101,6 +102,9 @@ class WebClientRuntimeTests(TestCase):
         for relative_path in required_files:
             with self.subTest(relative_path=relative_path):
                 self.assertTrue((self.runtime_root / relative_path).is_file())
+
+        source_revision = (self.runtime_root / ".source_revision").read_text().strip()
+        self.assertRegex(source_revision, r"^[0-9a-f]{40,64} clean$")
 
         forbidden_paths = (
             "js/node_modules",
