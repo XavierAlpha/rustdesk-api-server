@@ -31,14 +31,13 @@ build
 dist
 dist-
 dist_py38
-!static/web_client/js/dist/
-!static/web_client/js/dist/**
 static_root/
 records/
 db/*.sqlite3
 db.sqlite3
 db.sqlite3_bak
-static/web_client/js/node_modules/
+static/web_client/
+.web-client-source/
 
 LICENSE.rst
 
