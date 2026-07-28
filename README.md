@@ -142,7 +142,7 @@ Compose 示例见 [docker-compose.yaml](docker-compose.yaml)。
 
 ## Web 客户端静态资源
 
-Web 源码唯一位于客户端仓库的 `rustdesk/flutter/web`；本仓库的 `static/web_client` 只保存发布所需的 Flutter 构建产物与编译后桥接脚本。完成客户端构建后运行 `./sync_web_client.sh ../rustdesk/flutter/build/web`，脚本会在校验必要文件后原子替换运行资产，并剔除源码、包管理文件和构建工具。
+Web 源码唯一位于客户端仓库的 `rustdesk/flutter/web`；本仓库的 `static/web_client` 只保存发布所需的 Flutter 构建产物与编译后桥接脚本。推荐运行 `./sync_web_client.sh --build-from ../rustdesk`，脚本会先调用客户端的规范 release 构建，再校验 clean 源码提交标记并原子替换运行资产，同时剔除源码、包管理文件和构建工具。同步已有产物时必须显式使用 `--source ../rustdesk/flutter/build/web`；未携带来源提交或由 dirty 工作树生成的产物会被拒绝。
 
 ## CI
 

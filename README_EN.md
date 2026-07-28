@@ -142,7 +142,7 @@ See [docker-compose.yaml](docker-compose.yaml) for a Compose example.
 
 ## Web Client Assets
 
-The only Web source tree is `rustdesk/flutter/web` in the client repository. This repository's `static/web_client` contains only Flutter release output and the compiled bridge. After building the client, run `./sync_web_client.sh ../rustdesk/flutter/build/web`; it validates required files, atomically replaces the runtime assets, and strips source, package-manager files, and build tools.
+The only Web source tree is `rustdesk/flutter/web` in the client repository. This repository's `static/web_client` contains only Flutter release output and the compiled bridge. Prefer `./sync_web_client.sh --build-from ../rustdesk`: it runs the canonical client release build, verifies the clean source-revision stamp, atomically replaces the runtime assets, and strips source, package-manager files, and build tools. To synchronize an existing build, use `--source ../rustdesk/flutter/build/web` explicitly; artifacts without source provenance or produced from a dirty worktree are rejected.
 
 ## CI
 
