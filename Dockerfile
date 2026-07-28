@@ -53,13 +53,17 @@ WORKDIR /camellia-server
 
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=appuser:appuser manage.py version.py run.sh ./
+COPY --chown=appuser:appuser web-client.lock ./
 COPY --chown=appuser:appuser api ./api
 COPY --chown=appuser:appuser locale ./locale
 COPY --chown=appuser:appuser rustdesk_server_api ./rustdesk_server_api
 COPY --chown=appuser:appuser static ./static
 COPY --chown=appuser:appuser templates ./templates
 COPY --chown=appuser:appuser webui2 ./webui2
-RUN mkdir -p db records static_root \
+RUN locked_revision="$(tr -d '\r\n' < web-client.lock)" \
+    && printf '%s\n' "$locked_revision" | grep -Eq '^[0-9a-f]{40}$' \
+    && grep -Fxq "${locked_revision} clean" static/web_client/.source_revision \
+    && mkdir -p db records static_root \
     && chown appuser:appuser db records static_root
 
 USER appuser

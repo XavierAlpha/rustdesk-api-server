@@ -19,6 +19,7 @@ htmlcov
 db
 records
 static_root
+.web-client-source
 
 api/tests.py
 tutorial

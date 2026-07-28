@@ -1,0 +1,80 @@
+name: Build pinned RustDesk Web client
+description: Build the locked RustDesk Web revision from a repository owned by the current account
+
+inputs:
+  repository-name:
+    description: Repository name under github.repository_owner; owner-qualified names are rejected
+    required: false
+    default: rustdesk
+  flutter-version:
+    description: Flutter SDK version used by the RustDesk Web build
+    required: false
+    default: 3.44.5
+  node-version:
+    description: Node.js version used by the RustDesk Web bridge build
+    required: false
+    default: 24.18.0
+
+outputs:
+  revision:
+    description: Immutable RustDesk commit used for this build
+    value: ${{ steps.config.outputs.revision }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve locked source
+      id: config
+      shell: bash
+      env:
+        REPOSITORY_NAME: ${{ inputs.repository-name }}
+      run: |
+        if [[ ! "$REPOSITORY_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] \
+          || [[ "$REPOSITORY_NAME" == "." ]] \
+          || [[ "$REPOSITORY_NAME" == ".." ]]; then
+          echo "repository-name must be one unqualified repository name under the current owner" >&2
+          exit 1
+        fi
+        revision="$("$GITHUB_WORKSPACE/scripts/web_client_revision.sh")"
+        echo "repository=${GITHUB_REPOSITORY_OWNER}/${REPOSITORY_NAME}" >> "$GITHUB_OUTPUT"
+        echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+    - name: Checkout locked RustDesk source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: ${{ steps.config.outputs.repository }}
+        ref: ${{ steps.config.outputs.revision }}
+        path: .web-client-source
+        persist-credentials: false
+        submodules: recursive
+
+    - name: Verify checked-out source
+      shell: bash
+      env:
+        EXPECTED_REVISION: ${{ steps.config.outputs.revision }}
+      run: |
+        actual_revision="$(git -C "$GITHUB_WORKSPACE/.web-client-source" rev-parse HEAD)"
+        if [[ "$actual_revision" != "$EXPECTED_REVISION" ]]; then
+          echo "RustDesk checkout mismatch: expected $EXPECTED_REVISION, got $actual_revision" >&2
+          exit 1
+        fi
+
+    - name: Set up Flutter
+      uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+      with:
+        channel: stable
+        flutter-version: ${{ inputs.flutter-version }}
+        cache: true
+
+    - name: Set up Node.js
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+        cache-dependency-path: .web-client-source/flutter/web/js/package-lock.json
+
+    - name: Build and synchronize Web runtime
+      shell: bash
+      run: |
+        "$GITHUB_WORKSPACE/sync_web_client.sh" \
+          --build-from "$GITHUB_WORKSPACE/.web-client-source"

@@ -121,6 +121,7 @@ cp .env.example .env
 python -c 'import secrets; print(secrets.token_urlsafe(64))'
 python -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())'
 
+./sync_web_client.sh --build-from ../rustdesk
 docker compose build
 docker compose run --rm camellia-server python manage.py migrate --noinput
 docker compose run --rm camellia-server python manage.py createsuperuser
@@ -142,11 +143,20 @@ Compose 示例见 [docker-compose.yaml](docker-compose.yaml)。
 
 ## Web 客户端静态资源
 
-Web 源码唯一位于客户端仓库的 `rustdesk/flutter/web`；本仓库的 `static/web_client` 只保存发布所需的 Flutter 构建产物与编译后桥接脚本。推荐运行 `./sync_web_client.sh --build-from ../rustdesk`，脚本会先调用客户端的规范 release 构建，再校验 clean 源码提交标记并原子替换运行资产，同时剔除源码、包管理文件和构建工具。同步已有产物时必须显式使用 `--source ../rustdesk/flutter/build/web`；未携带来源提交或由 dirty 工作树生成的产物会被拒绝。
+Web 源码唯一位于客户端仓库的 `rustdesk/flutter/web`。本仓库只在 `web-client.lock` 中保存一个不可变的完整 commit，生成的 `static/web_client` 已被 Git 忽略，不再提交。纯 API 开发和常规单元测试无需在本地保留 Web 产物；运行 `/webui2/`、构建容器或在本地校验完整 Web runtime 前，再生成即可：
+
+```bash
+git -C ../rustdesk checkout "$(./scripts/web_client_revision.sh)"
+./sync_web_client.sh --build-from ../rustdesk
+```
+
+脚本会调用客户端的规范 release 构建，要求本地仓库和产物来源都与锁定 commit 完全一致，并校验 clean 来源标记后原子替换运行资产，同时剔除源码、包管理文件和构建工具。同步已有产物时必须显式使用 `--source ../rustdesk/flutter/build/web`；来源不明、dirty 或版本未锁定的产物都会被拒绝。更新 Web 时，应先提交并推送 RustDesk，再把 `web-client.lock` 改为该完整 commit；无需提交生成目录。
+
+CI 只访问与 API 仓库相同 GitHub owner 下的 RustDesk 仓库。仓库名默认是 `rustdesk`；如仓库改名，在 API 仓库中设置 Actions repository variable `RUSTDESK_REPOSITORY_NAME` 即可。变量只能是单一仓库名，不能包含 owner 或 `/`，因此不会跨账户取源码。
 
 ## CI
 
 仓库包含两个 workflow：
 
-- `API Server CI`：锁文件安装、编译、Ruff、开发/生产 Django check、迁移漂移检查、空数据库迁移、完整测试，以及只读非 root 容器的就绪探针。
-- `API Server Docker`：手动多架构构建，可选择发布到 GHCR 或 Docker Hub、启用 MySQL 驱动；发布镜像附带最大化 provenance 与 SBOM attestations。
+- `API Server CI`：从同 owner 仓库构建 `web-client.lock` 锁定的 Web commit，并让质量检查与容器检查复用同一 artifact；随后执行锁文件安装、编译、Ruff、开发/生产 Django check、迁移漂移检查、空数据库迁移、完整测试，以及只读非 root 容器的就绪探针。
+- `API Server Docker`：每次手动运行只构建一次锁定的 Web runtime，所有选中的多架构构建/发布任务复用它；可选择发布到 GHCR 或 Docker Hub、启用 MySQL 驱动，发布镜像附带最大化 provenance 与 SBOM attestations。

@@ -121,6 +121,7 @@ cp .env.example .env
 python -c 'import secrets; print(secrets.token_urlsafe(64))'
 python -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())'
 
+./sync_web_client.sh --build-from ../rustdesk
 docker compose build
 docker compose run --rm camellia-server python manage.py migrate --noinput
 docker compose run --rm camellia-server python manage.py createsuperuser
@@ -142,11 +143,20 @@ See [docker-compose.yaml](docker-compose.yaml) for a Compose example.
 
 ## Web Client Assets
 
-The only Web source tree is `rustdesk/flutter/web` in the client repository. This repository's `static/web_client` contains only Flutter release output and the compiled bridge. Prefer `./sync_web_client.sh --build-from ../rustdesk`: it runs the canonical client release build, verifies the clean source-revision stamp, atomically replaces the runtime assets, and strips source, package-manager files, and build tools. To synchronize an existing build, use `--source ../rustdesk/flutter/build/web` explicitly; artifacts without source provenance or produced from a dirty worktree are rejected.
+The only Web source tree is `rustdesk/flutter/web` in the client repository. This repository retains only one immutable full commit in `web-client.lock`; generated `static/web_client` assets are ignored by Git and are no longer committed. Pure API development and ordinary unit tests do not need a local Web build. Generate one only before serving `/webui2/`, building a container, or validating the complete runtime locally:
+
+```bash
+git -C ../rustdesk checkout "$(./scripts/web_client_revision.sh)"
+./sync_web_client.sh --build-from ../rustdesk
+```
+
+The script runs the canonical client release build, requires both the local repository and artifact provenance to match the locked commit, atomically replaces the runtime assets, and strips source, package-manager files, and build tools. To synchronize an existing build, use `--source ../rustdesk/flutter/build/web` explicitly. Unknown, dirty, or unlocked artifacts are rejected. To update Web, first commit and push RustDesk, then change `web-client.lock` to that full commit; never commit the generated directory.
+
+CI only accesses a RustDesk repository owned by the same GitHub owner as the API repository. Its name defaults to `rustdesk`. If the repository is renamed, set the Actions repository variable `RUSTDESK_REPOSITORY_NAME` in the API repository. The value must be one unqualified repository name without an owner or `/`, so source cannot be fetched across accounts.
 
 ## CI
 
 The repository contains two workflows:
 
-- `API Server CI`: locked dependency installation, compilation, Ruff, development and production Django checks, migration drift detection, an empty-database migration, the complete test suite, and a readiness probe against a read-only non-root container.
-- `API Server Docker`: manually triggered multi-architecture build with optional GHCR or Docker Hub publishing and optional MySQL support; published images include maximal provenance and SBOM attestations.
+- `API Server CI`: builds the Web commit locked by `web-client.lock` from the same owner's repository and reuses one artifact for quality and container checks, followed by locked dependency installation, compilation, Ruff, development and production Django checks, migration drift detection, an empty-database migration, the complete test suite, and a readiness probe against a read-only non-root container.
+- `API Server Docker`: builds the locked Web runtime once per manual run and reuses it across all selected multi-architecture build and publishing jobs, with optional GHCR or Docker Hub publishing and MySQL support; published images include maximal provenance and SBOM attestations.

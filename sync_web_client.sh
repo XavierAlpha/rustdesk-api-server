@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SRC_INPUT=""
 CLIENT_REPO_INPUT=""
+LOCKED_REVISION="$("${SCRIPT_DIR}/scripts/web_client_revision.sh")"
 
 usage() {
   cat <<'EOF'
@@ -13,7 +14,8 @@ Usage:
 
 Exactly one input mode is required. --build-from runs the client's canonical
 release build first; --source only synchronizes an already compiled, clean and
-revision-stamped build.
+revision-stamped build. Both modes require the source revision pinned by
+web-client.lock.
 EOF
 }
 
@@ -72,6 +74,11 @@ if [[ -n "$CLIENT_REPO_INPUT" ]]; then
     echo "Client repository has tracked changes; commit them before producing a synchronized runtime." >&2
     exit 1
   fi
+  EXPECTED_REVISION="$(git -C "$CLIENT_REPO" rev-parse HEAD)"
+  if [[ "$EXPECTED_REVISION" != "$LOCKED_REVISION" ]]; then
+    echo "Client repository revision does not match web-client.lock: expected $LOCKED_REVISION, got $EXPECTED_REVISION" >&2
+    exit 1
+  fi
 
   (cd "$CLIENT_REPO" && bash "$BUILD_SCRIPT" --mode release)
 
@@ -79,7 +86,6 @@ if [[ -n "$CLIENT_REPO_INPUT" ]]; then
     echo "Client build modified tracked source files; refusing to synchronize ambiguous output." >&2
     exit 1
   fi
-  EXPECTED_REVISION="$(git -C "$CLIENT_REPO" rev-parse HEAD)"
   SRC_INPUT="${CLIENT_REPO}/flutter/build/web"
 fi
 
@@ -112,6 +118,10 @@ if [[ ! "$SOURCE_REVISION_RECORD" =~ ^([0-9a-f]{40,64})[[:space:]]clean$ ]]; the
   exit 1
 fi
 SOURCE_REVISION="${BASH_REMATCH[1]}"
+if [[ "$SOURCE_REVISION" != "$LOCKED_REVISION" ]]; then
+  echo "Web client revision does not match web-client.lock: expected $LOCKED_REVISION, got $SOURCE_REVISION" >&2
+  exit 1
+fi
 if [[ -n "$EXPECTED_REVISION" && "$SOURCE_REVISION" != "$EXPECTED_REVISION" ]]; then
   echo "Web client provenance mismatch: expected $EXPECTED_REVISION, got $SOURCE_REVISION" >&2
   exit 1

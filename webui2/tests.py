@@ -1,6 +1,7 @@
 import json
 import re
 from pathlib import Path
+from unittest import skipUnless
 
 from django.conf import settings
 from django.contrib.staticfiles import finders
@@ -90,6 +91,10 @@ class WebClientRuntimeTests(TestCase):
     def runtime_root(self):
         return Path(settings.BASE_DIR) / "static" / "web_client"
 
+    @skipUnless(
+        (Path(settings.BASE_DIR) / "static" / "web_client" / ".source_revision").is_file(),
+        "Web runtime is generated on demand; run sync_web_client.sh to validate it locally",
+    )
     def test_runtime_bundle_excludes_build_tooling(self):
         required_files = (
             ".source_revision",
@@ -119,6 +124,10 @@ class WebClientRuntimeTests(TestCase):
             with self.subTest(relative_path=relative_path):
                 self.assertFalse((self.runtime_root / relative_path).exists())
 
+    @skipUnless(
+        (Path(settings.BASE_DIR) / "static" / "web_client" / ".source_revision").is_file(),
+        "Web runtime is generated on demand; run sync_web_client.sh to validate it locally",
+    )
     def test_bootstrap_has_one_complete_javascript_target(self):
         bootstrap = (self.runtime_root / "flutter_bootstrap.js").read_text()
         match = re.search(r"_flutter\.buildConfig = (\{[^\n]+\});", bootstrap)
