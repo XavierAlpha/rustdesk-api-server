@@ -39,7 +39,64 @@ runs:
         echo "repository=${GITHUB_REPOSITORY_OWNER}/${REPOSITORY_NAME}" >> "$GITHUB_OUTPUT"
         echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
+    - name: Verify locked RustDesk source policy
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPOSITORY: ${{ steps.config.outputs.repository }}
+        REVISION: ${{ steps.config.outputs.revision }}
+      run: |
+        default_branch="$(gh api "repos/$REPOSITORY" --jq .default_branch)"
+        default_revision="$(gh api "repos/$REPOSITORY/commits/$default_branch" --jq .sha)"
+        comparison_status="$(
+          gh api "repos/$REPOSITORY/compare/${REVISION}...${default_revision}" \
+            --jq .status
+        )"
+        if [[ "$comparison_status" != "ahead" && "$comparison_status" != "identical" ]]; then
+          echo "RustDesk revision $REVISION is not reachable from $default_branch" >&2
+          exit 1
+        fi
+
+        runs_json="$(
+          gh api -X GET "repos/$REPOSITORY/actions/runs" \
+            -f head_sha="$REVISION" \
+            -f event=push \
+            -f status=success \
+            -f per_page=100
+        )"
+        verified_run=""
+        while IFS= read -r run_id; do
+          jobs_json="$(
+            gh api -X GET "repos/$REPOSITORY/actions/runs/$run_id/jobs" \
+              -f per_page=100
+          )"
+          if [[ "$(
+            jq -r '[.jobs[] | select(.name == "CI / Required" and .conclusion == "success")] | length' \
+              <<< "$jobs_json"
+          )" == "1" ]]; then
+            verified_run="$run_id"
+            break
+          fi
+        done < <(jq -r '.workflow_runs | sort_by(.run_number) | reverse[] | .id' <<< "$runs_json")
+
+        if [[ -z "$verified_run" ]]; then
+          echo "RustDesk revision $REVISION has no successful push CI / Required check" >&2
+          exit 1
+        fi
+        echo "Verified RustDesk push CI run $verified_run for $REVISION"
+
+    - name: Restore compiled Web runtime
+      id: runtime-cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: static/web_client
+        key: >-
+          rustdesk-web-v1-${{ runner.os }}-${{ steps.config.outputs.revision }}-${{
+          inputs.flutter-version }}-${{ inputs.node-version }}-${{
+          hashFiles('sync_web_client.sh', '.github/actions/build-web-client/action.yml') }}
+
     - name: Checkout locked RustDesk source
+      if: steps.runtime-cache.outputs.cache-hit != 'true'
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         repository: ${{ steps.config.outputs.repository }}
@@ -49,6 +106,7 @@ runs:
         submodules: recursive
 
     - name: Verify checked-out source
+      if: steps.runtime-cache.outputs.cache-hit != 'true'
       shell: bash
       env:
         EXPECTED_REVISION: ${{ steps.config.outputs.revision }}
@@ -60,6 +118,7 @@ runs:
         fi
 
     - name: Set up Flutter
+      if: steps.runtime-cache.outputs.cache-hit != 'true'
       uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
       with:
         channel: stable
@@ -67,6 +126,7 @@ runs:
         cache: true
 
     - name: Set up Node.js
+      if: steps.runtime-cache.outputs.cache-hit != 'true'
       uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: ${{ inputs.node-version }}
@@ -74,7 +134,41 @@ runs:
         cache-dependency-path: .web-client-source/flutter/web/js/package-lock.json
 
     - name: Build and synchronize Web runtime
+      if: steps.runtime-cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
         "$GITHUB_WORKSPACE/sync_web_client.sh" \
           --build-from "$GITHUB_WORKSPACE/.web-client-source"
+
+    - name: Verify compiled Web runtime
+      shell: bash
+      env:
+        EXPECTED_REVISION: ${{ steps.config.outputs.revision }}
+      run: |
+        revision_file="$GITHUB_WORKSPACE/static/web_client/.source_revision"
+        if [[ ! -f "$revision_file" ]]; then
+          echo "Compiled Web runtime is missing $revision_file" >&2
+          exit 1
+        fi
+        revision_record="$(tr -d '\r\n' < "$revision_file")"
+        if [[ "$revision_record" != "$EXPECTED_REVISION clean" ]]; then
+          echo "Web runtime provenance mismatch: expected '$EXPECTED_REVISION clean', got '$revision_record'" >&2
+          exit 1
+        fi
+        required_files=(
+          flutter_bootstrap.js
+          main.dart.js
+          manifest.json
+          canvaskit/canvaskit.wasm
+          js/dist/web_bridge.js
+        )
+        for required_file in "${required_files[@]}"; do
+          if [[ ! -f "$GITHUB_WORKSPACE/static/web_client/$required_file" ]]; then
+            echo "Compiled Web runtime is missing $required_file" >&2
+            exit 1
+          fi
+        done
+        if [[ -n "$(find "$GITHUB_WORKSPACE/static/web_client" -type l -print -quit)" ]]; then
+          echo "Compiled Web runtime must not contain symbolic links" >&2
+          exit 1
+        fi
