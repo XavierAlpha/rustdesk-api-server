@@ -19,7 +19,7 @@ mysql = ["mysqlclient>=2.2,<3"]
 
 [dependency-groups]
 dev = [
-  "ruff>=0.15,<0.16",
+  "ruff>=0.16.0,<0.17",
   "pytest>=9,<10",
   "pytest-django>=4.12,<5",
   "coverage>=7.15,<8",
