@@ -5,7 +5,7 @@ description = "Camellia API server: accounts, address books, device management a
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-  "django>=6.0,<7.0",
+  "django>=6.1,<7.0",
   "openpyxl>=3.1,<4",
   "gunicorn>=26,<27",
   "whitenoise>=6.12,<7",
@@ -19,10 +19,10 @@ mysql = ["mysqlclient>=2.2,<3"]
 
 [dependency-groups]
 dev = [
-  "ruff>=0.15,<0.16",
+  "ruff>=0.16.1,<0.17",
   "pytest>=9,<10",
-  "pytest-django>=4.12,<5",
-  "coverage>=7.15,<8",
+  "pytest-django>=4.13.0,<5",
+  "coverage>=7.15.4,<8",
 ]
 
 [tool.uv]
